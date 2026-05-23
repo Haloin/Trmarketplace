@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex, nofollow">
+<title>TorMarket</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div id="app"></div>
+<template id="page-password">
+  <div class="page-center">
+    <div class="card login-card">
+      <h1>TorMarket</h1>
+      <p class="subtitle">Private decentralized marketplace</p>
+      <div id="password-status" class="status-msg"></div>
+      <form id="password-form" onsubmit="return APP.handlePasswordSubmit(event)">
+        <input type="hidden" id="is-new-user" value="true">
+        <div class="form-group">
+          <label for="password-input">Password</label>
+          <input type="password" id="password-input" required minlength="12" placeholder="Minimum 12 characters">
+        </div>
+        <div class="form-group" id="confirm-group">
+          <label for="confirm-password-input">Confirm Password</label>
+          <input type="password" id="confirm-password-input" required minlength="12" placeholder="Repeat password">
+        </div>
+        <button type="submit" id="btn-unlock" class="btn-primary">Create Identity</button>
+      </form>
+      <div class="key-display" id="key-display" style="display:none">
+        <p>Your public key:</p>
+        <code id="pubkey-display"></code>
+      </div>
+    </div>
+  </div>
+</template>
+<template id="page-home">
+  <div class="layout">
+    <nav class="topbar">
+      <a href="#/" class="logo">TorMarket</a>
+      <div class="nav-links">
+        <a href="#/create">+ New Listing</a>
+        <a href="#/orders">Orders</a>
+        <button class="btn-small" onclick="APP.logout()">Disconnect</button>
+      </div>
+    </nav>
+    <main class="content">
+      <div class="search-bar">
+        <input type="text" id="search-input" placeholder="Search listings..." oninput="APP.search()">
+        <select id="currency-filter" onchange="APP.search()">
+          <option value="">All currencies</option>
+          <option value="XMR">XMR</option>
+          <option value="BTC">BTC</option>
+        </select>
+      </div>
+      <div id="listing-grid" class="listing-grid"></div>
+      <div id="listings-status" class="status-msg"></div>
+    </main>
+  </div>
+</template>
+<template id="page-listing">
+  <div class="layout">
+    <nav class="topbar">
+      <a href="#/" class="logo">TorMarket</a>
+      <div class="nav-links">
+        <a href="#/orders">Orders</a>
+        <button class="btn-small" onclick="APP.logout()">Disconnect</button>
+      </div>
+    </nav>
+    <main class="content">
+      <a href="#/" class="back-link">&larr; Back</a>
+      <div id="listing-detail"></div>
+    </main>
+  </div>
+</template>
+<template id="page-create">
+  <div class="layout">
+    <nav class="topbar">
+      <a href="#/" class="logo">TorMarket</a>
+      <div class="nav-links">
+        <a href="#/orders">Orders</a>
+        <button class="btn-small" onclick="APP.logout()">Disconnect</button>
+      </div>
+    </nav>
+    <main class="content">
+      <h2>Create Listing</h2>
+      <form id="create-form" onsubmit="return APP.createListing(event)">
+        <label>Title <input type="text" id="listing-title" required maxlength="200"></label>
+        <label>Description <textarea id="listing-desc" required maxlength="10000"></textarea></label>
+        <label>Price
+          <div class="price-row">
+            <input type="text" id="listing-price" required pattern="^[0-9]+(\.[0-9]{1,12})?$" placeholder="0.00">
+            <select id="listing-currency">
+              <option value="XMR">XMR</option>
+              <option value="BTC">BTC</option>
+            </select>
+          </div>
+        </label>
+        <button type="submit" class="btn-primary">Create Listing</button>
+        <div id="create-status" class="status-msg"></div>
+      </form>
+    </main>
+  </div>
+</template>
+<template id="page-orders">
+  <div class="layout">
+    <nav class="topbar">
+      <a href="#/" class="logo">TorMarket</a>
+      <div class="nav-links">
+        <a href="#/create">+ New Listing</a>
+        <button class="btn-small" onclick="APP.logout()">Disconnect</button>
+      </div>
+    </nav>
+    <main class="content">
+      <h2>My Orders</h2>
+      <div id="orders-list"></div>
+    </main>
+  </div>
+</template>
+<template id="page-order">
+  <div class="layout">
+    <nav class="topbar">
+      <a href="#/" class="logo">TorMarket</a>
+      <div class="nav-links">
+        <a href="#/orders">Orders</a>
+        <button class="btn-small" onclick="APP.logout()">Disconnect</button>
+      </div>
+    </nav>
+    <main class="content">
+      <a href="#/orders" class="back-link">&larr; Orders</a>
+      <div id="order-detail"></div>
+      <div id="order-chat" class="chat-box"></div>
+      <div class="chat-input-row">
+        <input type="text" id="chat-input" placeholder="Type a message..." maxlength="5000">
+        <button onclick="APP.sendMessage()" class="btn-primary">Send</button>
+      </div>
+    </main>
+  </div>
+</template>
+<script src="/nacl.js"></script>
+<script src="/crypto.js"></script>
+<script src="/api.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

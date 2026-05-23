@@ -1,0 +1,12 @@
+/target
+*.pyc
+.DS_Store
+*.swp
+*.swo
+*~
+*.onion
+*.key
+/data
+/config.toml
+.env
+Cargo.lock

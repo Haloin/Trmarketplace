@@ -1,0 +1,84 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    command: >
+      sh -c "if [ -n \"$$REDIS_PASSWORD\" ]; then
+               redis-server --save '' --appendonly no --requirepass \"$$REDIS_PASSWORD\";
+             else
+               redis-server --save '' --appendonly no;
+             fi"
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal
+
+  monero-wallet-rpc:
+    image: ghcr.io/sethsimmons/simple-monero-wallet-rpc:latest
+    restart: unless-stopped
+    environment:
+      - MONERO_DAEMON_ADDRESS=node.monero.social:18081
+      - WALLET_RPC_BIND_ADDRESS=0.0.0.0:18089
+      - WALLET_RPC_LOG_LEVEL=1
+    volumes:
+      - monero_wallet:/wallet
+    networks:
+      - internal
+
+  marketplace:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - monero-wallet-rpc
+    environment:
+      - CONFIG_PATH=/app/config.toml
+      - REDIS_URL=redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379
+      - MONERO_RPC_URL=http://monero-wallet-rpc:18089/json_rpc
+      - LISTEN_ADDR=0.0.0.0:9080
+      - SERVER_SECRET=${SERVER_SECRET:?must be set}
+      - RUST_LOG=info
+    volumes:
+      - ./data:/app/data
+      - ./config.toml:/app/config.toml:ro
+    ports:
+      - "127.0.0.1:9080:9080"
+    networks:
+      - internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64M
+
+  tor:
+    image: alpine:latest
+    restart: unless-stopped
+    depends_on:
+      - marketplace
+    command: >
+      sh -c "apk add --no-cache tor && \
+             mkdir -p /app/data/tor && \
+             echo 'HiddenServiceDir /app/data/tor' > /etc/tor/torrc && \
+             echo 'HiddenServicePort 80 marketplace:9080' >> /etc/tor/torrc && \
+             tor -f /etc/tor/torrc"
+    volumes:
+      - ./data/tor:/app/data/tor
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  redis_data:
+  monero_wallet:
