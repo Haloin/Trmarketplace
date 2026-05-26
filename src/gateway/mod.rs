@@ -78,7 +78,7 @@ pub fn build_router(
         .layer(middleware::from_fn(validation_middleware))
         .layer(middleware::from_fn(rate_limit_middleware))
         .layer(middleware::from_fn(stateless_auth))
-        .layer(middleware::from_fn(error_unifier::error_unifier_middleware))
         .layer(middleware::from_fn(response_padding::response_padding_middleware))
+        .layer(middleware::from_fn(error_unifier::error_unifier_middleware))
         .with_state(app_state)
 }

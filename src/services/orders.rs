@@ -56,11 +56,6 @@ pub struct OrderResponse {
 }
 
 #[derive(Deserialize)]
-pub struct UpdateOrderRequest {
-    pub action: String,
-}
-
-#[derive(Deserialize)]
 pub struct FundOrderRequest {
     pub currency: String,
 }
@@ -127,7 +122,7 @@ async fn decrypt_order_data(order: &Order, state: &AppState) -> Result<OrderData
 
 async fn read_order(state: &AppState, id: &[u8]) -> Result<(Order, OrderData), AppError> {
     let order = sqlx::query_as::<_, Order>(
-        "SELECT id, encrypted_order_blob, day_bucket, expiry_bucket FROM orders WHERE id = ?1"
+        "SELECT id, encrypted_order_blob, day_bucket, expiry_bucket, version FROM orders WHERE id = ?1"
     )
     .bind(id)
     .fetch_optional(&state.pool)
@@ -144,14 +139,19 @@ async fn write_order(state: &AppState, order: &Order, data: &OrderData) -> Resul
     let blob = oblivious::encrypt_order_blob(&json, &state.master_seed[..], &order.id)
         .ok_or_else(|| AppError::Internal("Encryption failed".into()))?;
     let expiry_bucket = data.expires_at.map(floor_timestamp_6h);
-    let sql = "UPDATE orders SET encrypted_order_blob = ?1, expiry_bucket = ?2 WHERE id = ?3";
-    sqlx::query(sql)
-        .bind(&blob)
-        .bind(expiry_bucket)
-        .bind(&order.id)
-        .execute(&state.pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    let result = sqlx::query(
+        "UPDATE orders SET encrypted_order_blob = ?1, expiry_bucket = ?2, version = version + 1 WHERE id = ?3 AND version = ?4"
+    )
+    .bind(&blob)
+    .bind(expiry_bucket)
+    .bind(&order.id)
+    .bind(order.version)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::Conflict("Order was modified by another request".into()));
+    }
     Ok(())
 }
 
@@ -258,7 +258,7 @@ async fn create_order(
     .await
     .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
-    let order = Order { id: order_id_bytes, encrypted_order_blob: blob, day_bucket, expiry_bucket };
+    let order = Order { id: order_id_bytes, encrypted_order_blob: blob, day_bucket, expiry_bucket, version: 1 };
     Ok(Json(to_response(&order, &data)))
 }
 

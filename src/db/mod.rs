@@ -64,6 +64,9 @@ pub async fn run_sqlite_migrations(pool: &SqlitePool) -> Result<()> {
     if db_version < 11 {
         run_migration_v11(pool).await?;
     }
+    if db_version < 12 {
+        run_migration_v12(pool).await?;
+    }
 
     Ok(())
 }
@@ -612,6 +615,29 @@ async fn run_migration_v11(pool: &sqlx::SqlitePool) -> Result<()> {
     .bind(11i64)
     .bind(now)
     .bind("Rebuilt listings table: encrypted_listing_blob, day_bucket, search_token (dropped 11 plaintext columns)")
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn run_migration_v12(pool: &SqlitePool) -> Result<()> {
+    let now = crate::crypto::zk::floor_timestamp_6h(time::OffsetDateTime::now_utc().unix_timestamp());
+
+    if !column_exists(pool, "orders", "version").await {
+        if let Err(e) = sqlx::query("ALTER TABLE orders ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+            .execute(pool).await
+        {
+            tracing::warn!("Migration: could not add version column: {e}");
+        }
+    }
+
+    sqlx::query(
+        "INSERT INTO schema_migrations (version, applied_at, description) VALUES (?1, ?2, ?3)"
+    )
+    .bind(12i64)
+    .bind(now)
+    .bind("Added version column to orders for TOCTOU guard on concurrent writes")
     .execute(pool)
     .await?;
 

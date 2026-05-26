@@ -17,10 +17,11 @@ pub async fn check_time_locks(state: &Arc<AppState>) -> anyhow::Result<()> {
         let Some(raw) = oblivious::decrypt_order_blob(&order.encrypted_order_blob, &state.master_seed[..], &order.id) else { continue };
         let Ok(mut data) = serde_json::from_slice::<OrderData>(&raw) else { continue };
 
+        let version = order.version;
         match data.state.as_str() {
-            "shipped" => handle_shipped(&state, &order.id, &mut data, now).await?,
-            "funded" => handle_funded(&state, &order.id, &mut data, now).await?,
-            "disputed" => handle_disputed(&state, &order.id, &mut data, now).await?,
+            "shipped" => handle_shipped(&state, &order.id, &mut data, now, version).await?,
+            "funded" => handle_funded(&state, &order.id, &mut data, now, version).await?,
+            "disputed" => handle_disputed(&state, &order.id, &mut data, now, version).await?,
             _ => {}
         }
     }
@@ -32,23 +33,29 @@ fn has_active_dispute(data: &OrderData) -> bool {
     data.dispute.as_ref().map_or(false, |d| d.resolved_at.is_none())
 }
 
-async fn write_order(state: &Arc<AppState>, id: &[u8], data: &OrderData) -> anyhow::Result<()> {
+async fn write_order(state: &Arc<AppState>, id: &[u8], data: &OrderData, version: i64) -> anyhow::Result<()> {
     let json = serde_json::to_vec(data)?;
     let blob = oblivious::encrypt_order_blob(&json, &state.master_seed[..], id)
         .ok_or_else(|| anyhow::anyhow!("Encryption failed"))?;
     let expiry_bucket = data.expires_at.map(floor_timestamp_6h);
-    sqlx::query(
-        "UPDATE orders SET encrypted_order_blob = ?1, expiry_bucket = ?2 WHERE id = ?3"
+    let result = sqlx::query(
+        "UPDATE orders SET encrypted_order_blob = ?1, expiry_bucket = ?2, version = version + 1 WHERE id = ?3 AND version = ?4"
     )
     .bind(&blob)
     .bind(expiry_bucket)
     .bind(id)
+    .bind(version)
     .execute(&state.pool)
     .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(anyhow::anyhow!("order modified by concurrent writer"));
+    }
+
     Ok(())
 }
 
-async fn handle_shipped(state: &Arc<AppState>, id: &[u8], data: &mut OrderData, now: i64) -> anyhow::Result<()> {
+async fn handle_shipped(state: &Arc<AppState>, id: &[u8], data: &mut OrderData, now: i64, version: i64) -> anyhow::Result<()> {
     if has_active_dispute(data) {
         return Ok(());
     }
@@ -63,13 +70,13 @@ async fn handle_shipped(state: &Arc<AppState>, id: &[u8], data: &mut OrderData, 
     if now >= release_time {
         data.state = "released".to_string();
         data.released_at = Some(now);
-        write_order(state, id, data).await?;
+        write_order(state, id, data, version).await?;
     }
 
     Ok(())
 }
 
-async fn handle_funded(state: &Arc<AppState>, id: &[u8], data: &mut OrderData, now: i64) -> anyhow::Result<()> {
+async fn handle_funded(state: &Arc<AppState>, id: &[u8], data: &mut OrderData, now: i64, version: i64) -> anyhow::Result<()> {
     if has_active_dispute(data) {
         return Ok(());
     }
@@ -101,13 +108,13 @@ async fn handle_funded(state: &Arc<AppState>, id: &[u8], data: &mut OrderData, n
         data.dispute_id = Some(dispute.id.clone());
         data.dispute = Some(dispute);
 
-        write_order(state, id, data).await?;
+        write_order(state, id, data, version).await?;
     }
 
     Ok(())
 }
 
-async fn handle_disputed(state: &Arc<AppState>, id: &[u8], data: &mut OrderData, now: i64) -> anyhow::Result<()> {
+async fn handle_disputed(state: &Arc<AppState>, id: &[u8], data: &mut OrderData, now: i64, version: i64) -> anyhow::Result<()> {
     if !data.can_transition_to("refunded") {
         return Ok(());
     }
@@ -125,7 +132,7 @@ async fn handle_disputed(state: &Arc<AppState>, id: &[u8], data: &mut OrderData,
         data.state = "refunded".to_string();
         data.refunded_at = Some(now);
 
-        write_order(state, id, data).await?;
+        write_order(state, id, data, version).await?;
     }
 
     Ok(())

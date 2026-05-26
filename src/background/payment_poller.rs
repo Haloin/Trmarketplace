@@ -105,7 +105,6 @@ async fn check_xmr_payments(
 
                     let _ = mark_order_funded(state, row_id, now).await;
                 } else if status.received {
-                    let _ = 1;
                 } else {
                     let expiry = data.expires_at.unwrap_or(now + 86400);
                     if now > expiry {
@@ -154,7 +153,6 @@ async fn check_btc_payments(
 
                     let _ = mark_order_funded(state, row_id, now).await;
                 } else if status.received {
-                    let _ = 1;
                 } else {
                     let expiry = data.expires_at.unwrap_or(now + 86400);
                     if now > expiry {
@@ -195,14 +193,19 @@ async fn mark_order_funded(state: &Arc<AppState>, order_id: &[u8], now: i64) -> 
         .ok_or_else(|| anyhow::anyhow!("Encryption failed"))?;
     let expiry_bucket = data.expires_at.map(floor_timestamp_6h);
 
-    sqlx::query(
-        "UPDATE orders SET encrypted_order_blob = ?1, expiry_bucket = ?2 WHERE id = ?3"
+    let result = sqlx::query(
+        "UPDATE orders SET encrypted_order_blob = ?1, expiry_bucket = ?2, version = version + 1 WHERE id = ?3 AND version = ?4"
     )
     .bind(&new_blob)
     .bind(expiry_bucket)
     .bind(order_id)
+    .bind(order.version)
     .execute(&state.pool)
     .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(anyhow::anyhow!("order modified by concurrent writer"));
+    }
 
     Ok(())
 }
@@ -231,13 +234,18 @@ async fn mark_order_cancelled(state: &Arc<AppState>, order_id: &[u8]) -> anyhow:
     let new_blob = oblivious::encrypt_order_blob(&json, &state.master_seed[..], order_id)
         .ok_or_else(|| anyhow::anyhow!("Encryption failed"))?;
 
-    sqlx::query(
-        "UPDATE orders SET encrypted_order_blob = ?1 WHERE id = ?2"
+    let result = sqlx::query(
+        "UPDATE orders SET encrypted_order_blob = ?1, version = version + 1 WHERE id = ?2 AND version = ?3"
     )
     .bind(&new_blob)
     .bind(order_id)
+    .bind(order.version)
     .execute(&state.pool)
     .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(anyhow::anyhow!("order modified by concurrent writer"));
+    }
 
     Ok(())
 }

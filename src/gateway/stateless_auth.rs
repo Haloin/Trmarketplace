@@ -5,14 +5,14 @@ use axum::{
 };
 use ed25519_dalek::VerifyingKey;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use once_cell::sync::Lazy;
+use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 
 use crate::crypto::hash::hash_pubkey;
-use crate::gateway::auth_common::AuthPubkey;
+use crate::gateway::auth_common::{self, AuthPubkey};
 use crate::gateway::state::AppState;
 use crate::error::AppError;
 
@@ -20,13 +20,6 @@ type HmacSha256 = Hmac<Sha256>;
 
 static REPLAY_CACHE: Lazy<Mutex<HashMap<u64, HashSet<Vec<u8>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-
-fn derive_auth_key(server_secret: &str, pubkey: &[u8]) -> Option<Vec<u8>> {
-    let mut mac = HmacSha256::new_from_slice(server_secret.as_bytes()).ok()?;
-    mac.update(b"auth_key_derivation_v1");
-    mac.update(pubkey);
-    Some(mac.finalize().into_bytes().to_vec())
-}
 
 fn compute_hmac(auth_key: &[u8], pubkey: &[u8], hour_bucket: u64, path: &str, nonce: &[u8]) -> Option<Vec<u8>> {
     let mut mac = HmacSha256::new_from_slice(auth_key).ok()?;
@@ -141,7 +134,7 @@ pub async fn stateless_auth_middleware(
         return AppError::AuthFailed("stale hour bucket".into()).into_response();
     }
 
-    let auth_key = match derive_auth_key(&state.config.server.server_secret, &pk_bytes) {
+    let auth_key = match auth_common::derive_auth_key(&state.config.server.server_secret, &pk_bytes) {
         Some(k) => k,
         None => return AppError::AuthFailed("key derivation failed".into()).into_response(),
     };

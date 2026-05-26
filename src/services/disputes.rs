@@ -84,7 +84,7 @@ fn to_response(order_id: &str, d: &DisputeData) -> DisputeResponse {
     }
 }
 
-async fn read_order_data(state: &AppState, order_id: &str) -> Result<(Vec<u8>, OrderData), AppError> {
+async fn read_order_data(state: &AppState, order_id: &str) -> Result<(Vec<u8>, OrderData, i64), AppError> {
     let id_bytes = hex::decode(order_id)
         .map_err(|_| AppError::BadRequest("Invalid id".into()))?;
 
@@ -102,22 +102,28 @@ async fn read_order_data(state: &AppState, order_id: &str) -> Result<(Vec<u8>, O
     let data = serde_json::from_slice(&raw)
         .map_err(|e| AppError::Internal(format!("Corrupt order data: {e}")))?;
 
-    Ok((order.id, data))
+    Ok((order.id, data, order.version))
 }
 
-async fn write_order_data(state: &AppState, id: &[u8], data: &OrderData) -> Result<(), AppError> {
+async fn write_order_data(state: &AppState, id: &[u8], data: &OrderData, version: i64) -> Result<(), AppError> {
     let json = serde_json::to_vec(data)
         .map_err(|e| AppError::Internal(format!("Serialize: {e}")))?;
     let blob = oblivious::encrypt_order_blob(&json, &state.master_seed[..], id)
         .ok_or_else(|| AppError::Internal("Encryption failed".into()))?;
     let expiry_bucket = data.expires_at.map(floor_timestamp_6h);
-    sqlx::query("UPDATE orders SET encrypted_order_blob = ?1, expiry_bucket = ?2 WHERE id = ?3")
+    let result = sqlx::query(
+        "UPDATE orders SET encrypted_order_blob = ?1, expiry_bucket = ?2, version = version + 1 WHERE id = ?3 AND version = ?4"
+    )
         .bind(&blob)
         .bind(expiry_bucket)
         .bind(id)
+        .bind(version)
         .execute(&state.pool)
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::Conflict("Order was modified by another request".into()));
+    }
     Ok(())
 }
 
@@ -127,7 +133,7 @@ async fn open_dispute(
     Json(req): Json<OpenDisputeRequest>,
 ) -> Result<Json<DisputeResponse>, AppError> {
     let now = floor_timestamp_6h(OffsetDateTime::now_utc().unix_timestamp());
-    let (row_id, mut data) = read_order_data(&state, &req.order_id).await?;
+    let (row_id, mut data, version) = read_order_data(&state, &req.order_id).await?;
 
     let user_order_id = order_domain_id(&state.config.server.server_secret, &pubkey_hash)?;
     if !constant_time_compare(&data.buyer_pubkey_hash, &user_order_id) {
@@ -156,7 +162,7 @@ async fn open_dispute(
     data.state = "disputed".to_string();
     data.disputed_at = Some(now);
 
-    write_order_data(&state, &row_id, &data).await?;
+    write_order_data(&state, &row_id, &data, version).await?;
 
     let dispute = data.dispute.as_ref()
         .ok_or_else(|| AppError::Internal("Dispute data missing".into()))?;
@@ -172,7 +178,7 @@ async fn get_dispute(
     let (d, order_id) = disputes.into_iter().find(|(d, _)| d.id == id)
         .ok_or_else(|| AppError::NotFound("Dispute not found".into()))?;
 
-    let (_, data) = read_order_data(&state, &order_id).await?;
+    let (_, data, _) = read_order_data(&state, &order_id).await?;
     let user_order_id = order_domain_id(&state.config.server.server_secret, &pubkey_hash)?;
     if !constant_time_compare(&data.buyer_pubkey_hash, &user_order_id)
         && !constant_time_compare(&data.seller_pubkey_hash, &user_order_id)
@@ -189,7 +195,7 @@ async fn get_dispute_by_order(
     Extension(AuthPubkey(pubkey_hash)): Extension<AuthPubkey>,
     Path(order_id): Path<String>,
 ) -> Result<Json<DisputeResponse>, AppError> {
-    let (_, data) = read_order_data(&state, &order_id).await?;
+    let (_, data, _) = read_order_data(&state, &order_id).await?;
 
     let user_order_id = order_domain_id(&state.config.server.server_secret, &pubkey_hash)?;
     if !constant_time_compare(&data.buyer_pubkey_hash, &user_order_id)
@@ -217,7 +223,7 @@ async fn submit_evidence(
     let (_, order_id) = disputes.into_iter().find(|(d, _)| d.id == dispute_id)
         .ok_or_else(|| AppError::NotFound("Dispute not found".into()))?;
 
-    let (row_id, mut data) = read_order_data(&state, &order_id).await?;
+    let (row_id, mut data, version) = read_order_data(&state, &order_id).await?;
 
     let opened_by_hex;
     let is_dispute_resolved;
@@ -261,7 +267,7 @@ async fn submit_evidence(
         });
     }
 
-    write_order_data(&state, &row_id, &data).await?;
+    write_order_data(&state, &row_id, &data, version).await?;
 
     let dispute = data.dispute.as_ref()
         .ok_or_else(|| AppError::Internal("Dispute data missing".into()))?;
@@ -284,7 +290,7 @@ async fn resolve_dispute(
     let (_, order_id) = disputes.into_iter().find(|(d, _)| d.id == dispute_id)
         .ok_or_else(|| AppError::NotFound("Dispute not found".into()))?;
 
-    let (row_id, mut data) = read_order_data(&state, &order_id).await?;
+    let (row_id, mut data, version) = read_order_data(&state, &order_id).await?;
 
     let is_resolved;
     {
@@ -320,7 +326,7 @@ async fn resolve_dispute(
     data.dispute_id = None;
     data.disputed_at = None;
 
-    write_order_data(&state, &row_id, &data).await?;
+    write_order_data(&state, &row_id, &data, version).await?;
 
     let dispute = data.dispute.as_ref()
         .ok_or_else(|| AppError::Internal("Dispute data missing".into()))?;

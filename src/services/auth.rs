@@ -4,18 +4,15 @@ use axum::{
     routing::post,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use hmac::{Hmac, Mac};
 use once_cell::sync::Lazy;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::error::AppError;
+use crate::gateway::auth_common;
 use crate::gateway::state::AppState;
-
-type HmacSha256 = Hmac<Sha256>;
 
 const CHALLENGE_TTL_SECS: i64 = 300;
 
@@ -49,13 +46,6 @@ fn cleanup_challenges() {
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let mut store = CHALLENGES.lock().unwrap_or_else(|e| e.into_inner());
     store.retain(|_, (_, exp)| *exp > now);
-}
-
-fn derive_auth_key(server_secret: &str, pubkey: &[u8]) -> Option<Vec<u8>> {
-    let mut mac = HmacSha256::new_from_slice(server_secret.as_bytes()).ok()?;
-    mac.update(b"auth_key_derivation_v1");
-    mac.update(pubkey);
-    Some(mac.finalize().into_bytes().to_vec())
 }
 
 pub fn routes() -> Router<AppState> {
@@ -125,7 +115,7 @@ async fn verify(
     pk.verify(&challenge_bytes, &sig)
         .map_err(|_| AppError::BadRequest("signature verification failed".into()))?;
 
-    let auth_key = derive_auth_key(&state.config.server.server_secret, &pk_array)
+    let auth_key = auth_common::derive_auth_key(&state.config.server.server_secret, &pk_array)
         .ok_or(AppError::Internal("auth key derivation failed".into()))?;
 
     Ok(Json(VerifyResponse {

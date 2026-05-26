@@ -8,6 +8,7 @@ pub struct Order {
     pub encrypted_order_blob: Vec<u8>,
     pub day_bucket: i64,
     pub expiry_bucket: Option<i64>,
+    pub version: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
