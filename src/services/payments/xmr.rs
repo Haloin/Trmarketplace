@@ -1,11 +1,4 @@
-//! Monero Payment Service - View-Only Wallet
-//! 
-//! This module provides a view-only wallet implementation for Monero.
-//! The server can see incoming transactions but CANNOT spend funds.
-//! This is critical for security - even if server is compromised, attacker can't steal.
-//!
-//! SECURITY: All payment verification requires address + amount + confirmations match.
-//!           Fork detection with rollback capability prevents orphaned block attacks.
+//! Monero view-only wallet: detect payments, never spend. Fork detection included.
 
 use anyhow::{anyhow, Result};
 use rand::Rng;
@@ -20,6 +13,32 @@ use crate::config::MoneroConfig;
 /// Minimum payment amount in piconero (0.001 XMR)
 /// Prevents dust attack spam
 const MIN_PAYMENT_PICONERO: u64 = 1_000_000_000;
+
+/// All RPC request bodies are padded to this size on the wire
+/// to prevent traffic analysis from distinguishing operation types.
+const PADDED_BODY_SIZE: usize = 4096;
+
+/// Baseline for timing jitter (ms). Pre-request and post-response delays
+/// are each ~BASELINE_MS ± 30%, making total observable time per RPC call
+/// approximately 2× baseline regardless of server-side operation speed.
+const JITTER_BASELINE_MS: u64 = 1000;
+
+/// Pad a JSON-RPC body to exactly PADDED_BODY_SIZE bytes by inserting
+/// whitespace before the closing `}`. The result is still valid JSON.
+fn pad_json_body(body: &serde_json::Value) -> Vec<u8> {
+    let body_str = serde_json::to_string(body).expect("JSON serialization must not fail");
+    debug_assert!(body_str.ends_with('}'), "JSON body must end with '}}'");
+    let without_close = &body_str[..body_str.len() - 1];
+    let mut padded = String::with_capacity(PADDED_BODY_SIZE);
+    padded.push_str(without_close);
+    let remaining = PADDED_BODY_SIZE.saturating_sub(padded.len() + 1);
+    for _ in 0..remaining {
+        padded.push(' ');
+    }
+    padded.push('}');
+    debug_assert_eq!(padded.len(), PADDED_BODY_SIZE);
+    padded.into_bytes()
+}
 
 /// Incoming transfer with full verification data
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -69,10 +88,12 @@ pub struct MoneroViewOnlyClient {
 }
 
 impl MoneroViewOnlyClient {
-    pub fn new(config: MoneroConfig) -> Self {
+    /// Create a new Monero view-only client using a pre-built reqwest::Client.
+    /// The http client should come from Socks5Pool for circuit-isolated Tor routing.
+    pub fn new(config: MoneroConfig, http: reqwest::Client) -> Self {
         Self {
             config,
-            http: reqwest::Client::new(),
+            http,
             nonce: Arc::new(Mutex::new(0)),
             last_block_height: Arc::new(Mutex::new(0)),
             last_block_hash: Arc::new(Mutex::new(String::new())),
@@ -95,9 +116,10 @@ impl MoneroViewOnlyClient {
     }
 
     async fn rpc_call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-        // Blind RPC: random jitter prevents timing correlation attacks
+        // Pre-request jitter: ±30% of baseline
         {
-            let jitter_ms = rand::thread_rng().gen_range(700..1300);
+            let jitter_ms = (JITTER_BASELINE_MS as f64
+                * rand::thread_rng().gen_range(0.7..1.3)) as u64;
             tokio::time::sleep(tokio::time::Duration::from_millis(jitter_ms)).await;
         }
 
@@ -111,8 +133,11 @@ impl MoneroViewOnlyClient {
             "params": params,
         });
 
+        let padded_body = pad_json_body(&body);
+
         let mut req = self.http.post(&self.config.wallet_rpc_url)
-            .json(&body);
+            .header("Content-Type", "application/json")
+            .body(padded_body);
 
         if let Some(auth) = self.auth_header() {
             req = req.header("Authorization", auth);
@@ -123,6 +148,15 @@ impl MoneroViewOnlyClient {
 
         let json: serde_json::Value = resp.json().await
             .map_err(|e| anyhow!("XMR RPC parse failed: {}", e))?;
+
+        // Post-response jitter: normalize total round-trip time
+        // so fast operations (e.g. get_height ~5ms) and slow ones
+        // (e.g. create_address ~500ms) look identical on the wire.
+        {
+            let jitter_ms = (JITTER_BASELINE_MS as f64
+                * rand::thread_rng().gen_range(0.7..1.3)) as u64;
+            tokio::time::sleep(tokio::time::Duration::from_millis(jitter_ms)).await;
+        }
 
         if let Some(error) = json.get("error") {
             if !error.is_null() {
@@ -466,7 +500,50 @@ mod tests {
 
     #[test]
     fn test_min_payment_constant() {
-        // Verify minimum payment is reasonable (0.001 XMR = 1e9 piconero)
         assert_eq!(MIN_PAYMENT_PICONERO, 1_000_000_000);
+    }
+
+    #[test]
+    fn test_rpc_body_pads_to_4096() {
+        let bodies = vec![
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"get_height","params":null}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"create_address","params":{"account_index":0,"label":"order:abc"}}),
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"get_address_txs","params":{"address":"abc123","account_index":0}}),
+        ];
+        for body in &bodies {
+            let padded = pad_json_body(body);
+            assert_eq!(padded.len(), PADDED_BODY_SIZE);
+            assert!(padded.ends_with(b"}"));
+            // Verify it parses back as valid JSON
+            let parsed: serde_json::Value = serde_json::from_slice(&padded)
+                .expect("Padded body must be valid JSON");
+            assert_eq!(parsed["jsonrpc"], "2.0");
+            assert_eq!(parsed["method"], body["method"]);
+        }
+    }
+
+    #[test]
+    fn test_rpc_body_shorter_than_4096() {
+        // Even the most minimal body must be padded
+        let min_body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"x","params":null});
+        assert!(serde_json::to_string(&min_body).unwrap().len() < PADDED_BODY_SIZE,
+            "Precondition: minimal body is shorter than 4096");
+        let padded = pad_json_body(&min_body);
+        assert_eq!(padded.len(), PADDED_BODY_SIZE);
+    }
+
+    #[test]
+    fn test_padding_roundtrip_preserves_semantics() {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "get_balance",
+            "params": {"account_index": 0, "address": "abc"},
+        });
+        let padded = pad_json_body(&body);
+        let parsed: serde_json::Value = serde_json::from_slice(&padded).unwrap();
+        assert_eq!(parsed["method"], "get_balance");
+        assert_eq!(parsed["id"], 42);
+        assert_eq!(parsed["params"]["address"], "abc");
     }
 }

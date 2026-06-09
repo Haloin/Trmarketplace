@@ -3,12 +3,24 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct NotificationTracker {
+    pub tx_hash: Vec<u8>,
+    pub order_id: Vec<u8>,
+    pub buyer_pubkey: Vec<u8>,
+    pub processed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Order {
     pub id: Vec<u8>,
     pub encrypted_order_blob: Vec<u8>,
     pub day_bucket: i64,
     pub expiry_bucket: Option<i64>,
     pub version: i64,
+    pub has_dispute: i64,
+    pub client_encrypted_blob: Option<Vec<u8>>,
+    pub dispute_client_blob: Option<Vec<u8>>,
+    pub chat_encrypted_blob: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +49,8 @@ pub struct OrderData {
     pub fee_address: Option<String>,
     pub dispute: Option<DisputeData>,
     pub chat_messages: Vec<ChatMessageData>,
+    /// Bitcoin settlement txid — set after the release PSBT is broadcast.
+    pub settlement_txid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +89,9 @@ pub struct Listing {
     pub encrypted_listing_blob: Vec<u8>,
     pub day_bucket: i64,
     pub search_token: Option<Vec<u8>>,
+    pub status: String,
+    pub currency: String,
+    pub version: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,7 +113,7 @@ impl OrderData {
         match self.state.as_str() {
             "pending" => vec!["cancelled", "funded"],
             "funded" => vec!["shipped", "disputed"],
-            "shipped" => vec!["confirmed", "disputed", "released"],
+            "shipped" => vec!["confirmed", "disputed"],
             "confirmed" => vec!["released"],
             "disputed" => vec!["released", "refunded"],
             _ => vec![],

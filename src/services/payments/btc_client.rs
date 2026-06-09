@@ -1,7 +1,4 @@
-//! Bitcoin Payment Client (Production-ready)
-//!
-//! High-level payment verification for Bitcoin orders.
-//! Mirrors MoneroViewOnlyClient pattern for consistency.
+//! High-level Bitcoin payment verification.
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -60,11 +57,13 @@ pub struct BtcPaymentClient {
 }
 
 impl BtcPaymentClient {
-    pub fn new(config: BitcoinConfig) -> Result<Self, anyhow::Error> {
-        let inner = BitcoinClient::new(config)?;
-        Ok(Self {
+    /// Create a new BTC payment client using a pre-built reqwest::Client.
+    /// The http client should come from Socks5Pool for circuit-isolated Tor routing.
+    pub fn new(config: BitcoinConfig, http: reqwest::Client) -> Self {
+        let inner = BitcoinClient::new(config, http);
+        Self {
             inner: Arc::new(inner),
-        })
+        }
     }
 
     pub async fn wallet_is_ready(&self) -> Result<bool> {
@@ -131,7 +130,7 @@ impl BtcPaymentClient {
         let transfers = self.get_incoming_transfers(address).await?;
 
         for transfer in &transfers {
-            if !constant_time_eq_str(&transfer.address, &address) {
+            if !constant_time_eq_str(&transfer.address, address) {
                 continue;
             }
 
@@ -139,8 +138,8 @@ impl BtcPaymentClient {
                 continue;
             }
 
-                if transfer.amount >= expected_satoshis && expected_satoshis > 0 {
-                if transfer.confirmations as u64 >= required_confirmations {
+                if transfer.amount >= expected_satoshis && expected_satoshis > 0
+                && transfer.confirmations as u64 >= required_confirmations {
                     return Ok(BtcPaymentStatus::funded(
                         transfer.amount,
                         transfer.confirmations,
@@ -148,7 +147,6 @@ impl BtcPaymentClient {
                         address.to_string(),
                     ));
                 }
-            }
         }
 
         Ok(BtcPaymentStatus::not_received())

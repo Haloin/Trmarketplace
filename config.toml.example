@@ -1,21 +1,14 @@
-# Tor Marketplace Configuration
-# Copy this to config.toml and fill in your values
+# Tor Marketplace configuration
+# Copy to config.toml and adjust values.
 
-# ===================
-# DATABASE
-# ===================
 [database]
 type = "sqlite"
 path = "data/marketplace.db"
 
-# For production (PostgreSQL), uncomment below:
-# [database]
+# Production PostgreSQL (not wired yet):
 # type = "postgres"
 # url = "postgres://user:pass@localhost/marketplace"
 
-# ===================
-# SERVER
-# ===================
 [server]
 listen_addr = "127.0.0.1:9080"
 data_dir = "data"
@@ -23,54 +16,40 @@ server_secret = "CHANGE_ME_TO_A_LONG_RANDOM_STRING"
 rate_limit_per_minute = 30
 default_lock_days = 7
 
-# ===================
-# TOR
-# ===================
 [tor]
 enabled = true
 service_dir = "data/tor"
 port = 80
-# onion_address = "your-onion-address.onion"  # Uncomment if known
+# onion_address = "your-onion-address.onion"
 
-# ===================
-# MONERO (XMR)
-# ===================
 [monero]
 wallet_rpc_url = "http://127.0.0.1:18089/json_rpc"
-# wallet_rpc_user = "your_username"      # Uncomment and set
-# wallet_rpc_password = "your_password"  # Uncomment and set
+# wallet_rpc_user = ""
+# wallet_rpc_password = ""
 confirmations_required = 10
 
-# ===================
-# BITCOIN (BTC)
-# ===================
 [bitcoin]
 rpc_url = "http://127.0.0.1:8332"
-# rpc_user = "your_username"      # Uncomment and set
-# rpc_password = "your_password"  # Uncomment and set
+# rpc_user = ""
+# rpc_password = ""
 confirmations_required = 6
 wallet_name = "tor-marketplace"
 address_type = "p2sh-segwit"
 network = "mainnet"
 
-# ===================
-# SECURITY
-# ===================
 [security]
 max_order_value_xmr = 100.0
 max_order_value_btc = 1.0
 kek_rotation_days = 30
-# kek_hex = ""                      # Generated on first start, do not set manually
+# kek_hex = ""                      # set via KEK_HEX env in production
 # kek_version = 1
 # last_kek_rotation = 0
-# admin_pubkey = ""                 # Hex of admin's ed25519 pubkey for admin routes
+# admin_pubkey = ""                 # ed25519 pubkey for admin routes
 btc_min_payment_sats = 546
-# master_seed_hex = ""              # Generated on first start, do not set manually
+# master_seed_hex = ""              # generated on first worker start
+# worker_payment_pubkey_hex = ""    # X25519 pubkey for client order encryption
 
-# ===================
-# ESCROW
-# ===================
 [escrow]
 fee_percent = 4
-# fee_address_btc = "bc1..."       # Uncomment and set for production
-# fee_address_xmr = "4..."         # Uncomment and set for production
+# fee_address_btc = "bc1..."
+# fee_address_xmr = "4..."

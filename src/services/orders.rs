@@ -1,518 +1,243 @@
+//! Orders service — blind pass-through for opaque client-encrypted blobs.
+
 use axum::{
-    extract::{Path, State, Extension},
-    Json, Router,
+    extract::{Path, State, Extension, Json},
+    Router,
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
-
-use crate::db::models::{Order, OrderData, Listing, ListingData};
-use crate::crypto::oblivious;
-use crate::crypto::hmac_auth::{derive_domain_identity, domains};
-use crate::crypto::zk::{constant_time_compare, floor_timestamp_6h};
+use crate::crypto::transition_sig::{verify_transition, TransitionPayload};
+use crate::crypto::zk::floor_timestamp_6h;
 use crate::gateway::state::AppState;
-use crate::gateway::auth_common::AuthPubkey;
+use crate::gateway::auth_common::{AuthPubkey, AuthPubkeyBytes};
 use crate::error::AppError;
-use crate::crypto::escrow;
-use crate::services::escrow::btc::{create_multisig_p2wsh, import_multisig_watchonly, parse_secp_pubkey};
-use crate::services::payments::btc::BitcoinClient;
 
 #[derive(Deserialize)]
 pub struct CreateOrderRequest {
-    pub listing_id: String,
-    pub currency: Option<String>,
+    /// Opaque client-encrypted order blob (base64). Server stores as-is.
+    pub client_encrypted_blob: String,
+    /// Lock period in days. Used to compute expiry_bucket.
+    /// Default if omitted: 7 days.
     pub time_lock_days: Option<u64>,
-    pub buyer_pubkey: String,
+    /// Random nonce. Server rejects duplicates within a 1-hour bucket.
+    pub nonce: String,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateOrderRequest {
+    /// New opaque client-encrypted order blob (base64). Replaces the existing.
+    pub client_encrypted_blob: String,
+    /// Ed25519 signature over canonical CBOR transition payload (hex).
+    pub transition_signature: String,
+    pub nonce: String,
+    /// Hour bucket used in the signature payload. Must match the
+    /// `x-auth-hour` header. Passed explicitly to avoid server/client
+    /// clock skew causing signature mismatches at hour boundaries.
+    pub hour_bucket: u64,
 }
 
 #[derive(Serialize)]
 pub struct OrderResponse {
     pub id: String,
-    pub listing_id: String,
-    pub buyer_pubkey_hash: String,
-    pub seller_pubkey_hash: String,
-    pub buyer_pubkey: Option<String>,
-    pub seller_pubkey: Option<String>,
-    pub state: String,
-    pub currency: String,
-    pub escrow_address: Option<String>,
-    pub escrow_amount: Option<String>,
-    pub time_lock_seconds: i64,
-    pub created_at: i64,
-    pub funded_at: Option<i64>,
-    pub shipped_at: Option<i64>,
-    pub confirmed_at: Option<i64>,
-    pub released_at: Option<i64>,
-    pub refunded_at: Option<i64>,
-    pub expires_at: Option<i64>,
-    pub disputed_at: Option<i64>,
-    pub dispute_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner_pubkey: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fee_percent: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fee_address: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct FundOrderRequest {
-    pub currency: String,
+    pub client_encrypted_blob: Option<String>,
+    pub day_bucket: i64,
+    pub expiry_bucket: Option<i64>,
+    pub version: i64,
+    pub has_dispute: bool,
 }
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/orders", post(create_order))
-        .route("/orders/{id}", get(get_order))
-        .route("/orders/{id}/fund", post(fund_order))
-        .route("/orders/{id}/ship", post(ship_order))
-        .route("/orders/{id}/confirm", post(confirm_order))
-        .route("/orders/{id}/cancel", post(cancel_order))
-        .route("/orders/{id}/refund", post(refund_order))
+        .route("/orders/:id", get(get_order))
+        .route("/orders/:id/update", post(update_order))
 }
 
-fn to_response(order: &Order, data: &OrderData) -> OrderResponse {
-    OrderResponse {
-        id: hex::encode(&order.id),
-        listing_id: hex::encode(&data.listing_id),
-        buyer_pubkey_hash: hex::encode(&data.buyer_pubkey_hash),
-        seller_pubkey_hash: hex::encode(&data.seller_pubkey_hash),
-        buyer_pubkey: data.buyer_pubkey.clone(),
-        seller_pubkey: data.seller_pubkey.clone(),
-        state: data.state.clone(),
-        currency: data.currency.clone(),
-        escrow_address: data.escrow_address.clone(),
-        escrow_amount: data.escrow_amount.clone(),
-        time_lock_seconds: data.time_lock_seconds,
-        created_at: data.created_at,
-        funded_at: data.funded_at,
-        shipped_at: data.shipped_at,
-        confirmed_at: data.confirmed_at,
-        released_at: data.released_at,
-        refunded_at: data.refunded_at,
-        expires_at: data.expires_at,
-        disputed_at: data.disputed_at,
-        dispute_id: data.dispute_id.clone(),
-        owner_pubkey: data.owner_pubkey.clone(),
-        fee_percent: data.fee_percent,
-        fee_address: data.fee_address.clone(),
+const MAX_ORDER_BLOB_BYTES: usize = 256 * 1024;
+
+async fn create_order(
+    State(state): State<AppState>,
+    Extension(AuthPubkey(_pubkey_hash)): Extension<AuthPubkey>,
+    Json(req): Json<CreateOrderRequest>,
+) -> Result<Json<OrderResponse>, AppError> {
+    let blob = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.client_encrypted_blob)
+        .map_err(|e| AppError::BadRequest(format!("Invalid client_encrypted_blob base64: {e}")))?;
+    if blob.is_empty() {
+        return Err(AppError::BadRequest("client_encrypted_blob is empty".into()));
     }
-}
+    if blob.len() > MAX_ORDER_BLOB_BYTES {
+        return Err(AppError::BadRequest("client_encrypted_blob too large".into()));
+    }
 
-fn order_domain_id(secret: &str, pk_hash: &[u8]) -> Result<Vec<u8>, AppError> {
-    derive_domain_identity(secret.as_bytes(), domains::ORDERS, pk_hash)
-        .ok_or_else(|| AppError::Internal("Domain identity derivation failed".into()))
-}
+    if !check_create_nonce_replay(&req.nonce) {
+        return Err(AppError::Conflict("Create-order nonce already used".into()));
+    }
 
-fn decrypt_listing_data(listing: &Listing, master_seed: &[u8]) -> Option<ListingData> {
-    let raw = oblivious::decrypt_listing_blob(
-        &listing.encrypted_listing_blob,
-        master_seed,
-        &listing.id,
-    )?;
-    serde_json::from_slice(&raw).ok()
-}
+    let now = floor_timestamp_6h(OffsetDateTime::now_utc().unix_timestamp());
+    let lock_days = req.time_lock_days.unwrap_or(state.config.server.default_lock_days);
+    let lock_seconds = (lock_days as i64).saturating_mul(86400);
+    let expiry_bucket = floor_timestamp_6h(now.saturating_add(lock_seconds));
 
-async fn decrypt_order_data(order: &Order, state: &AppState) -> Result<OrderData, AppError> {
-    let raw = oblivious::decrypt_order_blob(&order.encrypted_order_blob, &state.master_seed[..], &order.id)
-        .ok_or_else(|| AppError::Internal("Failed to decrypt order".into()))?;
-    serde_json::from_slice(&raw)
-        .map_err(|e| AppError::Internal(format!("Corrupt order data: {e}")))
-}
+    let order_id = uuid::Uuid::new_v4().as_bytes().to_vec();
 
-async fn read_order(state: &AppState, id: &[u8]) -> Result<(Order, OrderData), AppError> {
-    let order = sqlx::query_as::<_, Order>(
-        "SELECT id, encrypted_order_blob, day_bucket, expiry_bucket, version FROM orders WHERE id = ?1"
+    sqlx::query(
+        "INSERT INTO orders (id, encrypted_order_blob, day_bucket, expiry_bucket) VALUES (?1, ?2, ?3, ?4)"
     )
-    .bind(id)
+    .bind(&order_id)
+    .bind(&blob)
+    .bind(now)
+    .bind(Some(expiry_bucket))
+    .execute(&state.pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    Ok(Json(OrderResponse {
+        id: hex::encode(&order_id),
+        client_encrypted_blob: Some(req.client_encrypted_blob),
+        day_bucket: now,
+        expiry_bucket: Some(expiry_bucket),
+        version: 1,
+        has_dispute: false,
+    }))
+}
+
+async fn get_order(
+    State(state): State<AppState>,
+    Extension(AuthPubkey(_pubkey_hash)): Extension<AuthPubkey>,
+    Path(id): Path<String>,
+) -> Result<Json<OrderResponse>, AppError> {
+    let id_bytes = hex::decode(&id)
+        .map_err(|_| AppError::BadRequest("Invalid order_id".into()))?;
+
+    let row: Option<(Vec<u8>, i64, Option<i64>, i64, i64)> = sqlx::query_as(
+        "SELECT encrypted_order_blob, day_bucket, expiry_bucket, version, has_dispute FROM orders WHERE id = ?1"
+    )
+    .bind(&id_bytes)
     .fetch_optional(&state.pool)
     .await
-    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
-    .ok_or_else(|| AppError::NotFound("Order not found".into()))?;
-    let data = decrypt_order_data(&order, state).await?;
-    Ok((order, data))
+    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    let (blob, day_bucket, expiry_bucket, version, has_dispute) = row
+        .ok_or_else(|| AppError::NotFound("Order not found".into()))?;
+
+    let blob_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &blob);
+
+    Ok(Json(OrderResponse {
+        id,
+        client_encrypted_blob: Some(blob_b64),
+        day_bucket,
+        expiry_bucket,
+        version,
+        has_dispute: has_dispute != 0,
+    }))
 }
 
-async fn write_order(state: &AppState, order: &Order, data: &OrderData) -> Result<(), AppError> {
-    let json = serde_json::to_vec(data)
-        .map_err(|e| AppError::Internal(format!("Serialize: {e}")))?;
-    let blob = oblivious::encrypt_order_blob(&json, &state.master_seed[..], &order.id)
-        .ok_or_else(|| AppError::Internal("Encryption failed".into()))?;
-    let expiry_bucket = data.expires_at.map(floor_timestamp_6h);
+async fn update_order(
+    State(state): State<AppState>,
+    Extension(AuthPubkey(_pubkey_hash)): Extension<AuthPubkey>,
+    Extension(AuthPubkeyBytes(pubkey_bytes)): Extension<AuthPubkeyBytes>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateOrderRequest>,
+) -> Result<Json<OrderResponse>, AppError> {
+    let id_bytes = hex::decode(&id)
+        .map_err(|_| AppError::BadRequest("Invalid order_id".into()))?;
+
+    let blob = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.client_encrypted_blob)
+        .map_err(|e| AppError::BadRequest(format!("Invalid client_encrypted_blob base64: {e}")))?;
+    if blob.is_empty() {
+        return Err(AppError::BadRequest("client_encrypted_blob is empty".into()));
+    }
+    if blob.len() > MAX_ORDER_BLOB_BYTES {
+        return Err(AppError::BadRequest("client_encrypted_blob too large".into()));
+    }
+
+    if !check_update_nonce_replay(&id, &req.nonce) {
+        return Err(AppError::Conflict("Update-order nonce already used".into()));
+    }
+
+    // TOCTOU: read version, conditional UPDATE with version bump.
+    let current: Option<(i64, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT version, day_bucket, expiry_bucket FROM orders WHERE id = ?1"
+    )
+    .bind(&id_bytes)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    let (v, day_bucket, expiry_bucket) = match current {
+        Some(v) => v,
+        None => return Err(AppError::NotFound("Order not found".into())),
+    };
+
+    // Verify transition signature over canonical CBOR payload.
+    let nonce_bytes = hex::decode(&req.nonce)
+        .map_err(|_| AppError::BadRequest("Invalid nonce hex".into()))?;
+    let sig_bytes = hex::decode(&req.transition_signature)
+        .map_err(|_| AppError::BadRequest("Invalid transition_signature hex".into()))?;
+    if sig_bytes.len() != 64 {
+        return Err(AppError::BadRequest("Transition signature must be 64 bytes".into()));
+    }
+    let mut sig_array = [0u8; 64];
+    sig_array.copy_from_slice(&sig_bytes);
+
+    let mut hasher = Sha256::new();
+    hasher.update(&blob);
+    let new_blob_hash: [u8; 32] = hasher.finalize().into();
+
+    let hour_bucket = req.hour_bucket;
+
+    let payload = TransitionPayload::new(
+        id_bytes.clone(),
+        v,
+        new_blob_hash,
+        nonce_bytes,
+        hour_bucket,
+    );
+
+    verify_transition(&pubkey_bytes, &payload, &sig_array)
+        .map_err(|e| AppError::AuthFailed(format!("Transition signature invalid: {e}")))?;
+
     let result = sqlx::query(
-        "UPDATE orders SET encrypted_order_blob = ?1, expiry_bucket = ?2, version = version + 1 WHERE id = ?3 AND version = ?4"
+        "UPDATE orders SET encrypted_order_blob = ?1, version = version + 1 WHERE id = ?2 AND version = ?3"
     )
     .bind(&blob)
-    .bind(expiry_bucket)
-    .bind(&order.id)
-    .bind(order.version)
+    .bind(&id_bytes)
+    .bind(v)
     .execute(&state.pool)
     .await
     .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
     if result.rows_affected() == 0 {
         return Err(AppError::Conflict("Order was modified by another request".into()));
     }
-    Ok(())
+
+    Ok(Json(OrderResponse {
+        id,
+        client_encrypted_blob: Some(req.client_encrypted_blob),
+        day_bucket,
+        expiry_bucket,
+        version: v + 1,
+        has_dispute: false,
+    }))
 }
 
-async fn create_order(
-    State(state): State<AppState>,
-    Extension(AuthPubkey(buyer_pk_hash)): Extension<AuthPubkey>,
-    Json(req): Json<CreateOrderRequest>,
-) -> Result<Json<OrderResponse>, AppError> {
-    let now = floor_timestamp_6h(OffsetDateTime::now_utc().unix_timestamp());
+fn check_create_nonce_replay(nonce: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use once_cell::sync::Lazy;
 
-    let listing_id = hex::decode(&req.listing_id)
-        .map_err(|_| AppError::BadRequest("Invalid listing_id".into()))?;
-
-    let listing = sqlx::query_as::<_, Listing>(
-        "SELECT * FROM listings WHERE id = ?1"
-    )
-    .bind(&listing_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
-    .ok_or_else(|| AppError::NotFound("Listing not found".into()))?;
-
-    let listing_data = decrypt_listing_data(&listing, &state.master_seed)
-        .ok_or_else(|| AppError::Internal("listing decryption failed".into()))?;
-
-    if listing_data.status != "active" {
-        return Err(AppError::NotFound("Listing not active".into()));
-    }
-
-    let buyer_order_id = order_domain_id(&state.config.server.server_secret, &buyer_pk_hash)?;
-    let seller_order_id = order_domain_id(&state.config.server.server_secret, &listing_data.seller_pubkey_hash)?;
-
-    if constant_time_compare(&seller_order_id, &buyer_order_id) {
-        return Err(AppError::BadRequest("Cannot buy your own listing".into()));
-    }
-
-    let lock_days = req.time_lock_days.unwrap_or(state.config.server.default_lock_days);
-    let lock_seconds = (lock_days * 86400) as i64;
-    let order_id_bytes = Order::new_id();
-    let escrow_amount = Some(listing_data.price_amount.clone());
-    let currency = req.currency.unwrap_or(listing_data.currency);
-    let currency_upper = currency.to_uppercase();
-
-    if currency_upper != "XMR" && currency_upper != "BTC" {
-        return Err(AppError::BadRequest("Currency must be XMR or BTC".into()));
-    }
-
-    let (owner_pubkey, fee_percent, fee_address) =
-        if currency_upper == "BTC" {
-            let sk = escrow::derive_order_key(&state.master_seed, &order_id_bytes)
-                .map_err(|e| AppError::Internal(format!("Key derivation failed: {e}")))?;
-            let pk = escrow::order_public_key(&sk);
-            (
-                Some(hex::encode(pk.serialize())),
-                Some(state.config.escrow.fee_percent as i64),
-                state.config.escrow.fee_address_btc.clone(),
-            )
-        } else {
-            (None, None, None)
-        };
-
-    let data = OrderData {
-        listing_id: listing_id.clone(),
-        buyer_pubkey_hash: buyer_order_id,
-        seller_pubkey_hash: seller_order_id,
-        buyer_pubkey: Some(req.buyer_pubkey.clone()),
-        seller_pubkey: listing_data.seller_pubkey.clone(),
-        state: "pending".to_string(),
-        currency,
-        escrow_address: None,
-        escrow_amount,
-        time_lock_seconds: lock_seconds,
-        created_at: now,
-        funded_at: None,
-        shipped_at: None,
-        confirmed_at: None,
-        released_at: None,
-        refunded_at: None,
-        expires_at: Some(now + lock_seconds),
-        disputed_at: None,
-        dispute_id: None,
-        owner_pubkey,
-        fee_percent,
-        fee_address,
-        dispute: None,
-        chat_messages: vec![],
-    };
-
-    let json = serde_json::to_vec(&data)
-        .map_err(|e| AppError::Internal(format!("Serialize: {e}")))?;
-    let blob = oblivious::encrypt_order_blob(&json, &state.master_seed[..], &order_id_bytes)
-        .ok_or_else(|| AppError::Internal("Encryption failed".into()))?;
-    let day_bucket = now;
-    let expiry_bucket = Some(floor_timestamp_6h(now + lock_seconds));
-
-    sqlx::query(
-        "INSERT INTO orders (id, encrypted_order_blob, day_bucket, expiry_bucket) VALUES (?1, ?2, ?3, ?4)"
-    )
-    .bind(&order_id_bytes)
-    .bind(&blob)
-    .bind(day_bucket)
-    .bind(expiry_bucket)
-    .execute(&state.pool)
-    .await
-    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-
-    let order = Order { id: order_id_bytes, encrypted_order_blob: blob, day_bucket, expiry_bucket, version: 1 };
-    Ok(Json(to_response(&order, &data)))
+    static CREATE_NONCES: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+    let mut set = CREATE_NONCES.lock().unwrap_or_else(|e| e.into_inner());
+    set.insert(nonce.to_string())
 }
 
-async fn fund_order(
-    State(state): State<AppState>,
-    Extension(AuthPubkey(user_pk_hash)): Extension<AuthPubkey>,
-    Path(id): Path<String>,
-    Json(req): Json<FundOrderRequest>,
-) -> Result<Json<OrderResponse>, AppError> {
-    let id_bytes = hex::decode(&id)
-        .map_err(|_| AppError::BadRequest("Invalid id".into()))?;
+fn check_update_nonce_replay(order_id: &str, nonce: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use once_cell::sync::Lazy;
 
-    let (order, mut data) = read_order(&state, &id_bytes).await?;
-
-    let user_order_id = order_domain_id(&state.config.server.server_secret, &user_pk_hash)?;
-    if !constant_time_compare(&data.buyer_pubkey_hash, &user_order_id) {
-        return Err(AppError::Forbidden("Only buyer can fund order".into()));
-    }
-
-    if !data.can_transition_to("funded") {
-        return Err(AppError::BadRequest(
-            format!("Invalid state transition: {} -> funded", data.state)
-        ));
-    }
-
-    let listing = sqlx::query_as::<_, Listing>(
-        "SELECT * FROM listings WHERE id = ?1"
-    )
-    .bind(&data.listing_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
-    .ok_or_else(|| AppError::NotFound("Listing not found".into()))?;
-
-    let listing_data = decrypt_listing_data(&listing, &state.master_seed)
-        .ok_or_else(|| AppError::Internal("listing decryption failed".into()))?;
-
-    let currency_upper = req.currency.to_uppercase();
-    if currency_upper != "XMR" && currency_upper != "BTC" {
-        return Err(AppError::BadRequest("Currency must be XMR or BTC".into()));
-    }
-
-    if listing_data.currency != currency_upper {
-        return Err(AppError::BadRequest(
-            format!("Listing {} only accepts {}, not {}", hex::encode(&listing.id), listing_data.currency, currency_upper)
-        ));
-    }
-
-    let now = floor_timestamp_6h(OffsetDateTime::now_utc().unix_timestamp());
-
-    let (escrow_address, _multi_sig_key, _multi_sig_redeem_script) =
-        if currency_upper == "BTC" {
-            let buyer_pk_hex = data.buyer_pubkey.as_ref()
-                .ok_or_else(|| AppError::BadRequest("Missing buyer pubkey for BTC multi-sig".into()))?;
-            let seller_pk_hex = data.seller_pubkey.as_ref()
-                .ok_or_else(|| AppError::BadRequest("Missing seller pubkey for BTC multi-sig".into()))?;
-            let owner_pk_hex = data.owner_pubkey.as_ref()
-                .ok_or_else(|| AppError::BadRequest("Missing owner pubkey".into()))?;
-
-            let buyer_pk = parse_secp_pubkey(buyer_pk_hex)
-                .map_err(|_| AppError::BadRequest("Invalid buyer pubkey".into()))?;
-            let seller_pk = parse_secp_pubkey(seller_pk_hex)
-                .map_err(|_| AppError::BadRequest("Invalid seller pubkey".into()))?;
-            let owner_pk = parse_secp_pubkey(owner_pk_hex)
-                .map_err(|_| AppError::BadRequest("Invalid owner pubkey".into()))?;
-
-            let network = state.config.bitcoin.btc_network()
-                .map_err(|e| AppError::Internal(format!("Config error: {e}")))?;
-
-            let ms = create_multisig_p2wsh(&buyer_pk, &seller_pk, &owner_pk, network)
-                .map_err(|e| AppError::Internal(format!("Multi-sig creation failed: {e}")))?;
-
-            let rpc = BitcoinClient::new(state.config.bitcoin.clone())
-                .map_err(|e| AppError::Internal(format!("BTC RPC client: {e}")))?;
-            let label = format!("order:{}", hex::encode(&id_bytes));
-            import_multisig_watchonly(&ms.address, &ms.redeem_script_hex, &label, &rpc)
-                .await
-                .map_err(|e| AppError::Internal(format!("BTC import failed: {e}")))?;
-
-            (Some(ms.address.clone()), Some(ms.address.into_bytes()), Some(ms.redeem_script_hex))
-        } else {
-            let xmr_client = crate::services::payments::xmr::MoneroViewOnlyClient::new(state.config.monero.clone());
-            match xmr_client.create_subaddress(&hex::encode(&id_bytes)).await {
-                Ok(addr) => (Some(addr), None, None),
-                Err(_) => {
-                    return Err(AppError::Internal("Failed to create XMR payment address".into()));
-                }
-            }
-        };
-
-    data.state = "funded".to_string();
-    data.currency = currency_upper;
-    data.escrow_address = escrow_address;
-    data.funded_at = Some(now);
-
-    write_order(&state, &order, &data).await?;
-
-    Ok(Json(to_response(&order, &data)))
-}
-
-async fn get_order(
-    State(state): State<AppState>,
-    Extension(AuthPubkey(user_pk_hash)): Extension<AuthPubkey>,
-    Path(id): Path<String>,
-) -> Result<Json<OrderResponse>, AppError> {
-    let id_bytes = hex::decode(&id)
-        .map_err(|_| AppError::BadRequest("Invalid id".into()))?;
-
-    let (order, data) = read_order(&state, &id_bytes).await?;
-
-    let user_order_id = order_domain_id(&state.config.server.server_secret, &user_pk_hash)?;
-    if !constant_time_compare(&data.buyer_pubkey_hash, &user_order_id)
-        && !constant_time_compare(&data.seller_pubkey_hash, &user_order_id)
-    {
-        return Err(AppError::Forbidden("Not your order".into()));
-    }
-
-    Ok(Json(to_response(&order, &data)))
-}
-
-async fn ship_order(
-    State(state): State<AppState>,
-    Extension(AuthPubkey(user_pk_hash)): Extension<AuthPubkey>,
-    Path(id): Path<String>,
-) -> Result<Json<OrderResponse>, AppError> {
-    let id_bytes = hex::decode(&id)
-        .map_err(|_| AppError::BadRequest("Invalid id".into()))?;
-
-    let (order, mut data) = read_order(&state, &id_bytes).await?;
-
-    let user_order_id = order_domain_id(&state.config.server.server_secret, &user_pk_hash)?;
-    if !constant_time_compare(&data.seller_pubkey_hash, &user_order_id) {
-        return Err(AppError::Forbidden("Only seller can ship".into()));
-    }
-
-    if data.state == "disputed" {
-        return Err(AppError::BadRequest("Cannot ship disputed order".into()));
-    }
-
-    if !data.can_transition_to("shipped") {
-        return Err(AppError::BadRequest(
-            format!("Invalid state transition: {} -> shipped", data.state)
-        ));
-    }
-
-    let now = floor_timestamp_6h(OffsetDateTime::now_utc().unix_timestamp());
-    data.state = "shipped".to_string();
-    data.shipped_at = Some(now);
-    write_order(&state, &order, &data).await?;
-
-    Ok(Json(to_response(&order, &data)))
-}
-
-async fn confirm_order(
-    State(state): State<AppState>,
-    Extension(AuthPubkey(user_pk_hash)): Extension<AuthPubkey>,
-    Path(id): Path<String>,
-) -> Result<Json<OrderResponse>, AppError> {
-    let id_bytes = hex::decode(&id)
-        .map_err(|_| AppError::BadRequest("Invalid id".into()))?;
-
-    let (order, mut data) = read_order(&state, &id_bytes).await?;
-
-    let user_order_id = order_domain_id(&state.config.server.server_secret, &user_pk_hash)?;
-    if !constant_time_compare(&data.buyer_pubkey_hash, &user_order_id) {
-        return Err(AppError::Forbidden("Only buyer can confirm".into()));
-    }
-
-    if data.state == "disputed" {
-        return Err(AppError::BadRequest("Cannot confirm disputed order".into()));
-    }
-
-    if !data.can_transition_to("confirmed") {
-        return Err(AppError::BadRequest(
-            format!("Invalid state transition: {} -> confirmed", data.state)
-        ));
-    }
-
-    let now = floor_timestamp_6h(OffsetDateTime::now_utc().unix_timestamp());
-
-    if data.can_transition_to("released") {
-        data.state = "released".to_string();
-        data.released_at = Some(now);
-        data.confirmed_at = Some(now);
-    } else {
-        data.state = "confirmed".to_string();
-        data.confirmed_at = Some(now);
-    }
-    write_order(&state, &order, &data).await?;
-
-    Ok(Json(to_response(&order, &data)))
-}
-
-async fn cancel_order(
-    State(state): State<AppState>,
-    Extension(AuthPubkey(user_pk_hash)): Extension<AuthPubkey>,
-    Path(id): Path<String>,
-) -> Result<Json<OrderResponse>, AppError> {
-    let id_bytes = hex::decode(&id)
-        .map_err(|_| AppError::BadRequest("Invalid id".into()))?;
-
-    let (order, mut data) = read_order(&state, &id_bytes).await?;
-
-    let user_order_id = order_domain_id(&state.config.server.server_secret, &user_pk_hash)?;
-    if !constant_time_compare(&data.seller_pubkey_hash, &user_order_id) {
-        return Err(AppError::Forbidden("Only seller can cancel".into()));
-    }
-
-    if data.state == "disputed" {
-        return Err(AppError::BadRequest("Cannot cancel disputed order".into()));
-    }
-
-    if !data.can_transition_to("cancelled") {
-        return Err(AppError::BadRequest(
-            format!("Invalid state transition: {} -> cancelled", data.state)
-        ));
-    }
-
-    data.state = "cancelled".to_string();
-    write_order(&state, &order, &data).await?;
-
-    Ok(Json(to_response(&order, &data)))
-}
-
-async fn refund_order(
-    State(state): State<AppState>,
-    Extension(AuthPubkey(user_pk_hash)): Extension<AuthPubkey>,
-    Path(id): Path<String>,
-) -> Result<Json<OrderResponse>, AppError> {
-    let id_bytes = hex::decode(&id)
-        .map_err(|_| AppError::BadRequest("Invalid id".into()))?;
-
-    let (order, mut data) = read_order(&state, &id_bytes).await?;
-
-    let user_order_id = order_domain_id(&state.config.server.server_secret, &user_pk_hash)?;
-    if !constant_time_compare(&data.buyer_pubkey_hash, &user_order_id) {
-        return Err(AppError::Forbidden("Only buyer can request refund".into()));
-    }
-
-    let now = floor_timestamp_6h(OffsetDateTime::now_utc().unix_timestamp());
-
-    if data.state != "disputed" {
-        return Err(AppError::BadRequest("Refund not available: open a dispute first".into()));
-    }
-
-    if !data.can_transition_to("refunded") {
-        return Err(AppError::BadRequest(
-            format!("Invalid state transition: {} -> refunded", data.state)
-        ));
-    }
-
-    data.state = "refunded".to_string();
-    data.refunded_at = Some(now);
-    write_order(&state, &order, &data).await?;
-
-    Ok(Json(to_response(&order, &data)))
+    static UPDATE_NONCES: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+    let key = format!("{}:{}", order_id, nonce);
+    let mut set = UPDATE_NONCES.lock().unwrap_or_else(|e| e.into_inner());
+    set.insert(key)
 }

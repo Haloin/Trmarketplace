@@ -1,8 +1,12 @@
+[workspace]
+resolver = "2"
+members = [".", "wasm"]
+
 [package]
 name = "tor-marketplace"
 version = "0.1.0"
 edition = "2021"
-description = "Privacy-first marketplace backend with Tor hidden service, XMR payments, and time-locked escrow"
+description = "Privacy-first Tor marketplace with blind API, WASM client, and BTC/XMR payments"
 authors = ["torMarketplace"]
 license = "MIT"
 
@@ -14,8 +18,18 @@ path = "src/lib.rs"
 name = "tor-marketplace"
 path = "src/main.rs"
 
+# Worker binary: cargo build --features worker --bin tor-marketplace-worker
+[[bin]]
+name = "tor-marketplace-worker"
+path = "src/bin/worker.rs"
+required-features = ["worker"]
+
+[features]
+default = []
+worker = []
+
 [dependencies]
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "set-header", "compression-gzip", "fs"] }
@@ -33,6 +47,12 @@ k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 bitcoin = { version = "0.32", features = ["rand-std"] }
 secp256k1 = { version = "0.29", features = ["rand-std"] }
 
+# Cryptography - Admin blind signatures (Chaum RSA blind sig protocol)
+rsa = { version = "0.9", features = ["sha2", "pem"] }
+pkcs8 = { version = "0.10", features = ["std"] }
+num-bigint-dig = "0.8"
+num-integer = "0.1"
+
 # Cryptography - Encryption
 chacha20poly1305 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -41,6 +61,7 @@ blake3 = "1"
 # Cryptography - Hash/KDF
 sha2 = "0.10"
 hmac = "0.12"
+hkdf = "0.12"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 
 # Utilities
@@ -51,6 +72,7 @@ base64 = "0.22"
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2.6"
 parking_lot = "0.12"
+ciborium = "0.2"
 
 # Logging
 tracing = "0.1"
@@ -64,7 +86,7 @@ anyhow = "1"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 
 # HTTP
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "socks"], default-features = false }
 
 # Config
 toml = "0.8"

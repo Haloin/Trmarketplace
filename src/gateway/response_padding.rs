@@ -8,14 +8,6 @@ use axum::{
 
 const PADDED_SIZE: usize = 4096;
 
-fn padded_size(actual: usize) -> usize {
-    if actual == 0 {
-        PADDED_SIZE
-    } else {
-        ((actual + PADDED_SIZE - 1) / PADDED_SIZE) * PADDED_SIZE
-    }
-}
-
 pub async fn response_padding_middleware(
     request: Request,
     next: Next,
@@ -36,14 +28,21 @@ pub async fn response_padding_middleware(
         }
     };
 
-    let target_len = padded_size(body_bytes.len());
-    let mut padded: Vec<u8> = body_bytes.to_vec();
-    padded.resize(target_len, b' ');
+    if body_bytes.len() > PADDED_SIZE {
+        let _ = parts.headers.insert(
+            "Content-Length",
+            HeaderValue::from_str(&body_bytes.len().to_string())
+                .unwrap_or_else(|_| HeaderValue::from_static("4096")),
+        );
+        return Response::from_parts(parts, Body::from(body_bytes));
+    }
 
-    let len_str = target_len.to_string();
+    let mut padded: Vec<u8> = body_bytes.to_vec();
+    padded.resize(PADDED_SIZE, b' ');
+
     let _ = parts.headers.insert(
         "Content-Length",
-        HeaderValue::from_str(&len_str).unwrap_or_else(|_| HeaderValue::from_static("4096")),
+        HeaderValue::from_static("4096"),
     );
 
     Response::from_parts(parts, Body::from(Bytes::from(padded)))

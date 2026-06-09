@@ -1,162 +1,154 @@
+//! Chat service — blind pass-through for opaque chat blobs.
+
 use axum::{
-    extract::{Path, State, Extension},
-    Json, Router,
+    extract::{Path, State, Extension, Json},
+    Router,
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
-use crate::db::models::{Order, OrderData, ChatMessageData};
-use crate::crypto::oblivious;
-use crate::crypto::hmac_auth::{derive_domain_identity, domains};
-use crate::crypto::zk::{constant_time_compare, floor_timestamp_6h};
 use crate::gateway::state::AppState;
 use crate::gateway::auth_common::AuthPubkey;
 use crate::error::AppError;
 
 #[derive(Deserialize)]
 pub struct SendMessageRequest {
-    pub encrypted_body: String,
+    /// New opaque chat blob. Replaces the existing one entirely.
+    /// The client maintains a ratchet — it decrypts the old blob, appends
+    /// the new message, re-encrypts, and sends the result here.
+    pub chat_encrypted_blob: String,
+    pub transition_signature: String,
+    pub nonce: String,
 }
 
 #[derive(Serialize)]
-pub struct MessageResponse {
-    pub id: String,
+pub struct ChatResponse {
     pub order_id: String,
-    pub sender_pubkey_hash: String,
-    pub encrypted_body: String,
-    pub created_at: i64,
+    /// Current opaque chat blob (base64). May be empty if no chat yet.
+    pub chat_encrypted_blob: Option<String>,
+    /// Current version for the next transition signature.
+    pub version: i64,
 }
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/chat/{order_id}", get(get_messages))
-        .route("/chat/{order_id}", post(send_message))
+        .route("/chat/:order_id", get(get_chat))
+        .route("/chat/:order_id", post(update_chat))
 }
 
-fn order_domain_id(secret: &str, pk_hash: &[u8]) -> Result<Vec<u8>, AppError> {
-    derive_domain_identity(secret.as_bytes(), domains::ORDERS, pk_hash)
-        .ok_or_else(|| AppError::Internal("Domain identity derivation failed".into()))
-}
-
-fn chat_domain_id(secret: &str, pk_hash: &[u8]) -> Result<Vec<u8>, AppError> {
-    derive_domain_identity(secret.as_bytes(), domains::CHAT, pk_hash)
-        .ok_or_else(|| AppError::Internal("Domain identity derivation failed".into()))
-}
-
-async fn read_order_data(state: &AppState, order_id: &str) -> Result<(Vec<u8>, OrderData), AppError> {
-    let id_bytes = hex::decode(order_id)
+async fn get_chat(
+    State(state): State<AppState>,
+    Extension(AuthPubkey(_pubkey_hash)): Extension<AuthPubkey>,
+    Path(order_id): Path<String>,
+) -> Result<Json<ChatResponse>, AppError> {
+    let id_bytes = hex::decode(&order_id)
         .map_err(|_| AppError::BadRequest("Invalid order_id".into()))?;
 
-    let order = sqlx::query_as::<_, Order>(
-        "SELECT * FROM orders WHERE id = ?1"
+    // Read the order row. We need version + chat_encrypted_blob only.
+    // The server does not check that the order exists — if it does not, the
+    // chat blob is just None. The client knows whether the order exists.
+    let row: Option<(Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT id, version FROM orders WHERE id = ?1"
     )
     .bind(&id_bytes)
     .fetch_optional(&state.pool)
     .await
-    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
-    .ok_or_else(|| AppError::NotFound("Order not found".into()))?;
+    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
-    let raw = oblivious::decrypt_order_blob(&order.encrypted_order_blob, &state.master_seed[..], &order.id)
-        .ok_or_else(|| AppError::Internal("Failed to decrypt order".into()))?;
-    let data = serde_json::from_slice(&raw)
-        .map_err(|e| AppError::Internal(format!("Corrupt order data: {e}")))?;
-
-    Ok((order.id, data))
-}
-
-async fn write_order_data(state: &AppState, id: &[u8], data: &OrderData) -> Result<(), AppError> {
-    let json = serde_json::to_vec(data)
-        .map_err(|e| AppError::Internal(format!("Serialize: {e}")))?;
-    let blob = oblivious::encrypt_order_blob(&json, &state.master_seed[..], id)
-        .ok_or_else(|| AppError::Internal("Encryption failed".into()))?;
-    let expiry_bucket = data.expires_at.map(floor_timestamp_6h);
-    sqlx::query("UPDATE orders SET encrypted_order_blob = ?1, expiry_bucket = ?2 WHERE id = ?3")
-        .bind(&blob)
-        .bind(expiry_bucket)
-        .bind(id)
-        .execute(&state.pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-    Ok(())
-}
-
-async fn send_message(
-    State(state): State<AppState>,
-    Extension(AuthPubkey(sender_pk_hash)): Extension<AuthPubkey>,
-    Path(order_id): Path<String>,
-    Json(req): Json<SendMessageRequest>,
-) -> Result<Json<MessageResponse>, AppError> {
-    let now = floor_timestamp_6h(OffsetDateTime::now_utc().unix_timestamp());
-    let ttl = 7 * 86400;
-
-    let (row_id, mut data) = read_order_data(&state, &order_id).await?;
-
-    let user_order_id = order_domain_id(&state.config.server.server_secret, &sender_pk_hash)?;
-    if !constant_time_compare(&data.buyer_pubkey_hash, &user_order_id)
-        && !constant_time_compare(&data.seller_pubkey_hash, &user_order_id)
-    {
-        return Err(AppError::Forbidden("Not part of this order".into()));
-    }
-
-    let encrypted_body = hex::decode(&req.encrypted_body)
-        .map_err(|_| AppError::BadRequest("Invalid encrypted_body hex".into()))?;
-
-    let sender_chat_id = chat_domain_id(&state.config.server.server_secret, &sender_pk_hash)?;
-    let msg = ChatMessageData {
-        id: ChatMessageData::new_id(),
-        sender_pubkey_hash: sender_chat_id,
-        encrypted_body,
-        created_at: now,
-        expires_at: now + ttl,
+    let (version, chat_blob) = match row {
+        Some((_id, v)) => {
+            let blob: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
+                "SELECT chat_encrypted_blob FROM orders WHERE id = ?1"
+            )
+            .bind(&id_bytes)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+            (v, blob.and_then(|b| b.0))
+        }
+        None => (0, None),
     };
 
-    data.chat_messages.push(msg);
+    let blob_b64 = chat_blob.map(|b| {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b)
+    });
 
-    write_order_data(&state, &row_id, &data).await?;
-
-    let msg = data.chat_messages.last().unwrap();
-    Ok(Json(MessageResponse {
-        id: hex::encode(&msg.id),
+    Ok(Json(ChatResponse {
         order_id,
-        sender_pubkey_hash: hex::encode(&msg.sender_pubkey_hash),
-        encrypted_body: hex::encode(&msg.encrypted_body),
-        created_at: msg.created_at,
+        chat_encrypted_blob: blob_b64,
+        version,
     }))
 }
 
-async fn get_messages(
+async fn update_chat(
     State(state): State<AppState>,
-    Extension(AuthPubkey(user_pk_hash)): Extension<AuthPubkey>,
+    Extension(AuthPubkey(_pubkey_hash)): Extension<AuthPubkey>,
     Path(order_id): Path<String>,
-) -> Result<Json<Vec<MessageResponse>>, AppError> {
-    let now = floor_timestamp_6h(OffsetDateTime::now_utc().unix_timestamp());
+    Json(req): Json<SendMessageRequest>,
+) -> Result<Json<ChatResponse>, AppError> {
+    let id_bytes = hex::decode(&order_id)
+        .map_err(|_| AppError::BadRequest("Invalid order_id".into()))?;
 
-    let (row_id, mut data) = read_order_data(&state, &order_id).await?;
+    let new_blob = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.chat_encrypted_blob)
+        .map_err(|e| AppError::BadRequest(format!("Invalid chat_encrypted_blob base64: {e}")))?;
 
-    let user_order_id = order_domain_id(&state.config.server.server_secret, &user_pk_hash)?;
-    if !constant_time_compare(&data.buyer_pubkey_hash, &user_order_id)
-        && !constant_time_compare(&data.seller_pubkey_hash, &user_order_id)
-    {
-        return Err(AppError::Forbidden("Not part of this order".into()));
+    // Size cap only — server does not validate blob content.
+    const MAX_CHAT_BLOB_BYTES: usize = 256 * 1024;
+    if new_blob.len() > MAX_CHAT_BLOB_BYTES {
+        return Err(AppError::BadRequest("chat_encrypted_blob too large".into()));
     }
 
-    let before = data.chat_messages.len();
-    data.chat_messages.retain(|m| m.expires_at > now);
-    if data.chat_messages.len() < before {
-        write_order_data(&state, &row_id, &data).await?;
+    // TOCTOU guard: read version, then conditional UPDATE.
+    let current: Option<(i64,)> = sqlx::query_as(
+        "SELECT version FROM orders WHERE id = ?1"
+    )
+    .bind(&id_bytes)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    let current_version = match current {
+        Some((v,)) => v,
+        None => return Err(AppError::NotFound("Order not found".into())),
+    };
+
+    // Replay-cache the chat nonce (separate from auth nonce).
+    if !check_chat_nonce_replay(&order_id, &req.nonce) {
+        return Err(AppError::Conflict("Chat nonce already used".into()));
     }
 
-    Ok(Json(
-        data.chat_messages
-            .iter()
-            .map(|m| MessageResponse {
-                id: hex::encode(&m.id),
-                order_id: order_id.clone(),
-                sender_pubkey_hash: hex::encode(&m.sender_pubkey_hash),
-                encrypted_body: hex::encode(&m.encrypted_body),
-                created_at: m.created_at,
-            })
-            .collect(),
-    ))
+    let result = sqlx::query(
+        "UPDATE orders SET chat_encrypted_blob = ?1, version = version + 1 WHERE id = ?2 AND version = ?3"
+    )
+    .bind(&new_blob)
+    .bind(&id_bytes)
+    .bind(current_version)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::Conflict("Order was modified by another request".into()));
+    }
+
+    // pubkey_hash is logged at debug only; never at info or warn, to avoid
+    // emitting user-identifying strings to logs.
+    tracing::debug!(order_id = %order_id, "Chat blob updated");
+
+    Ok(Json(ChatResponse {
+        order_id,
+        chat_encrypted_blob: Some(req.chat_encrypted_blob),
+        version: current_version + 1,
+    }))
+}
+
+fn check_chat_nonce_replay(order_id: &str, nonce: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use once_cell::sync::Lazy;
+
+    static CHAT_NONCES: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+    let key = format!("{}:{}", order_id, nonce);
+    let mut set = CHAT_NONCES.lock().unwrap_or_else(|e| e.into_inner());
+    set.insert(key)
 }

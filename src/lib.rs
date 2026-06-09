@@ -6,3 +6,5 @@ pub mod gateway;
 pub mod services;
 pub mod tor;
 pub mod background;
+#[cfg(feature = "worker")]
+pub mod worker;

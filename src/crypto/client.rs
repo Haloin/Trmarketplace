@@ -1,11 +1,4 @@
-//! Client-Side Encryption Helpers
-//! 
-//! This module provides functions that clients (Tauri app, web frontend) use
-//! to encrypt data before sending to the server. The server should never see
-//! plaintext of any user data.
-//!
-//! SECURITY: All functions use XChaCha20-Poly1305 with OsRng nonce generation.
-//!           Error handling returns Result<> instead of panicking.
+
 
 use chacha20poly1305::{aead::Aead, KeyInit};
 use rand::RngCore;
@@ -50,31 +43,30 @@ impl Drop for KeyPair {
     }
 }
 
-/// Encrypt a message for a recipient using their public key
-/// Uses X25519 + ChaCha20-Poly1305 pattern (TweetNaCl style)
+
 pub fn encrypt_message(plaintext: &[u8], recipient_pubkey: &[u8; 32], sender_seckey: &[u8; 32]) -> CryptoResult<Vec<u8>> {
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
     use x25519_dalek::{PublicKey, StaticSecret};
     
-    // Generate ephemeral keypair
+    
     let sender_secret = StaticSecret::from(*sender_seckey);
     let recipient_public = PublicKey::from(*recipient_pubkey);
     
-    // Compute shared secret
+    
     let shared = sender_secret.diffie_hellman(&recipient_public);
     let shared_bytes: &[u8; 32] = shared.as_bytes();
     
-    // Create cipher with shared secret as key
+    
     let key: [u8; 32] = *shared_bytes;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)
         .map_err(|_| "Invalid key".to_string())?;
     
-    // Generate random nonce
+    
     let mut nonce_bytes = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     
-    // Encrypt - return error instead of panic
+    
     let ciphertext = cipher.encrypt(nonce, plaintext)
         .map_err(|_| "Encryption failed".to_string())?;
     
@@ -86,8 +78,6 @@ pub fn encrypt_message(plaintext: &[u8], recipient_pubkey: &[u8; 32], sender_sec
     Ok(result)
 }
 
-/// Decrypt a message using our private key
-/// SECURITY: Returns error instead of panicking on invalid input
 pub fn decrypt_message(ciphertext_with_nonce: &[u8], sender_pubkey: &[u8; 32], recipient_seckey: &[u8; 32]) -> CryptoResult<Vec<u8>> {
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
     use x25519_dalek::{PublicKey, StaticSecret};
@@ -99,7 +89,7 @@ pub fn decrypt_message(ciphertext_with_nonce: &[u8], sender_pubkey: &[u8; 32], r
     let (nonce_bytes, ciphertext) = ciphertext_with_nonce.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
     
-    // Compute shared secret
+    
     let recipient_secret = StaticSecret::from(*recipient_seckey);
     let sender_public = PublicKey::from(*sender_pubkey);
     let shared = recipient_secret.diffie_hellman(&sender_public);
@@ -115,8 +105,7 @@ pub fn decrypt_message(ciphertext_with_nonce: &[u8], sender_pubkey: &[u8; 32], r
         .map_err(|_| "Decryption failed".to_string())
 }
 
-/// Encrypt listing content for storage
-/// Combines title, description, and metadata into a single encrypted blob
+
 pub fn encrypt_listing_content(
     title: &str,
     description: &str,
@@ -150,8 +139,7 @@ pub fn encrypt_listing_content(
     Ok(result)
 }
 
-/// Decrypt listing content
-/// SECURITY: Returns error instead of panicking on invalid input
+
 pub fn decrypt_listing_content(encrypted: &[u8], content_key: &[u8; 32]) -> CryptoResult<serde_json::Value> {
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
     
@@ -172,9 +160,7 @@ pub fn decrypt_listing_content(encrypted: &[u8], content_key: &[u8; 32]) -> Cryp
         .map_err(|_| "Deserialization failed".to_string())
 }
 
-/// Generate search tokens from listing content
-/// These are deterministically encrypted so same term = same token
-/// SECURITY: Uses full 32-byte blake3 hash (not truncated) for token consistency
+
 pub fn generate_search_tokens(content: &str, search_key: &[u8]) -> Vec<Vec<u8>> {
     use blake3::Hasher;
     
@@ -182,14 +168,14 @@ pub fn generate_search_tokens(content: &str, search_key: &[u8]) -> Vec<Vec<u8>> 
     
     for word in content.split_whitespace() {
         if word.len() < 2 {
-            continue; // Skip single-character words
+            continue; 
         }
         
         let mut hasher = Hasher::new();
         hasher.update(word.as_bytes());
         hasher.update(search_key);
         
-        // SECURITY: Use FULL 32 bytes for token consistency with server
+        
         let hash = hasher.finalize();
         tokens.push(hash.as_bytes().to_vec());
     }
@@ -197,8 +183,7 @@ pub fn generate_search_tokens(content: &str, search_key: &[u8]) -> Vec<Vec<u8>> 
     tokens
 }
 
-/// Generate a single search token (for query matching)
-/// Returns 32-byte token as Vec<u8>
+
 pub fn generate_single_token(keyword: &str, search_key: &[u8]) -> Vec<u8> {
     use blake3::Hasher;
     

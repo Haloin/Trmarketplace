@@ -5,13 +5,32 @@ use crate::crypto::zk::{constant_time_compare, floor_timestamp_6h};
 use crate::gateway::state::AppState;
 use crate::services::payments::xmr::{MoneroViewOnlyClient, PaymentAuditRecord};
 use crate::services::payments::btc_client::BtcPaymentClient;
+use rand::Rng;
 
 const REQUIRED_CONFIRMATIONS_XMR: u64 = 10;
 const REQUIRED_CONFIRMATIONS_BTC: u64 = 6;
 const MIN_PAYMENT_SATS: u64 = 546;
 
+/// Get worker key for decryption. Workers must have worker_key set.
+fn get_worker_key(state: &AppState) -> anyhow::Result<&[u8; 32]> {
+    state.worker_key.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Worker key not configured - workers cannot decrypt"))
+}
+
+/// Dummy payment check to obfuscate timing: adds ~10-50ms of fake work
+/// with 30% probability to prevent timing side channels.
+async fn dummy_payment_check() {
+    if !rand::thread_rng().gen_bool(0.3) {
+        return;
+    }
+    // Simulate a brief RPC call
+    let delay_ms = rand::thread_rng().gen_range(10..50);
+    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+}
+
 pub async fn check_pending_payments(state: &Arc<AppState>) -> anyhow::Result<()> {
     let now = floor_timestamp_6h(time::OffsetDateTime::now_utc().unix_timestamp());
+    let worker_key = get_worker_key(state)?;
 
     let orders = sqlx::query_as::<_, Order>(
         "SELECT * FROM orders"
@@ -20,39 +39,61 @@ pub async fn check_pending_payments(state: &Arc<AppState>) -> anyhow::Result<()>
     .await?;
 
     let xmr_client = get_or_init_xmr_client(state).await;
-    let btc_client = get_or_init_btc_client(state).await?;
+    let btc_client = get_or_init_btc_client(state).await;
 
     let mut xmr_orders = Vec::new();
     let mut btc_orders = Vec::new();
+    let mut order_map: std::collections::HashMap<Vec<u8>, (usize, OrderData)> = std::collections::HashMap::new();
+
+    let payment_decrypt_sk = crate::crypto::escrow::derive_domain_key(worker_key, "payment-decrypt");
 
     for order in &orders {
-        let Some(raw) = oblivious::decrypt_order_blob(&order.encrypted_order_blob, &state.master_seed[..], &order.id) else { continue };
-        let Ok(data) = serde_json::from_slice::<OrderData>(&raw) else { continue };
-        if data.escrow_address.is_none() { continue; }
-        if data.state != "pending" { continue; }
-        match data.currency.as_str() {
-            "XMR" => xmr_orders.push((order.id.clone(), data)),
-            "BTC" => btc_orders.push((order.id.clone(), data)),
-            _ => {}
+        let raw = oblivious::decrypt_ecdh_blob(&order.encrypted_order_blob, &payment_decrypt_sk)
+            .or_else(|| oblivious::decrypt_order_blob(&order.encrypted_order_blob, worker_key, &order.id));
+        let Some(raw) = raw else {
+            dummy_payment_check().await;
+            continue;
+        };
+        let Ok(data) = serde_json::from_slice::<OrderData>(&raw) else {
+            dummy_payment_check().await;
+            continue;
+        };
+        if data.escrow_address.is_none() {
+            dummy_payment_check().await;
+            continue;
+        }
+        match data.state.as_str() {
+            "pending" => {
+                match data.currency.as_str() {
+                    "XMR" => xmr_orders.push((order.id.clone(), data)),
+                    "BTC" => btc_orders.push((order.id.clone(), data)),
+                    _ => dummy_payment_check().await,
+                }
+            }
+            "released" => {
+                if data.currency == "BTC" && data.settlement_txid.is_none() {
+                    order_map.insert(order.id.clone(), (order.version as usize, data));
+                } else {
+                    dummy_payment_check().await;
+                }
+            }
+            _ => dummy_payment_check().await,
         }
     }
 
-    if xmr_orders.is_empty() && btc_orders.is_empty() {
-        return Ok(());
+    if !xmr_orders.is_empty() || !btc_orders.is_empty() {
+        if let Ok(false) = xmr_client.check_for_fork().await {
+            check_xmr_payments(&xmr_client, state, &xmr_orders, now).await?;
+        }
+
+        if let Ok(false) = btc_client.check_for_fork().await {
+            check_btc_payments(&btc_client, state, &btc_orders, now).await?;
+        }
     }
 
-    match xmr_client.check_for_fork().await {
-        Ok(false) => {
-            check_xmr_payments(&xmr_client, &state, &xmr_orders, now).await?;
-        }
-        _ => {}
-    }
-
-    match btc_client.check_for_fork().await {
-        Ok(false) => {
-            check_btc_payments(&btc_client, &state, &btc_orders, now).await?;
-        }
-        _ => {}
+    // Retry settlement for released BTC orders without a settlement txid.
+    for order_id in order_map.into_keys() {
+        let _ = retry_btc_settlement(state, &order_id).await;
     }
 
     Ok(())
@@ -65,11 +106,12 @@ async fn check_xmr_payments(
     now: i64,
 ) -> anyhow::Result<()> {
     for (row_id, data) in orders {
-        let Some(ref escrow_addr) = data.escrow_address else { continue };
+        let Some(ref escrow_addr) = data.escrow_address else { dummy_payment_check().await; continue; };
         let amount_str = data.escrow_amount.as_deref().unwrap_or("0");
         let expected_piconero = parse_xmr_amount_safe(amount_str);
 
         if expected_piconero == 0 {
+            dummy_payment_check().await;
             continue;
         }
 
@@ -80,12 +122,14 @@ async fn check_xmr_payments(
         ).await {
             Ok(status) => {
                 if status.fork_detected {
+                    dummy_payment_check().await;
                     continue;
                 }
 
                 if status.received && status.confirmations >= REQUIRED_CONFIRMATIONS_XMR {
                     if let Some(ref returned_addr) = status.address {
                         if !constant_time_compare(returned_addr.as_bytes(), escrow_addr.as_bytes()) {
+                            dummy_payment_check().await;
                             continue;
                         }
                     }
@@ -105,14 +149,17 @@ async fn check_xmr_payments(
 
                     let _ = mark_order_funded(state, row_id, now).await;
                 } else if status.received {
+                    dummy_payment_check().await;
                 } else {
                     let expiry = data.expires_at.unwrap_or(now + 86400);
                     if now > expiry {
                         let _ = mark_order_cancelled(state, row_id).await;
+                    } else {
+                        dummy_payment_check().await;
                     }
                 }
             }
-            Err(_) => {}
+            Err(_) => dummy_payment_check().await,
         }
     }
 
@@ -126,11 +173,12 @@ async fn check_btc_payments(
     now: i64,
 ) -> anyhow::Result<()> {
     for (row_id, data) in orders {
-        let Some(ref escrow_addr) = data.escrow_address else { continue };
+        let Some(ref escrow_addr) = data.escrow_address else { dummy_payment_check().await; continue; };
         let amount_str = data.escrow_amount.as_deref().unwrap_or("0");
         let expected_sats = parse_btc_amount_safe(amount_str);
 
         if expected_sats == 0 {
+            dummy_payment_check().await;
             continue;
         }
 
@@ -141,26 +189,31 @@ async fn check_btc_payments(
         ).await {
             Ok(status) => {
                 if status.fork_detected {
+                    dummy_payment_check().await;
                     continue;
                 }
 
                 if status.received && u64::from(status.confirmations) >= REQUIRED_CONFIRMATIONS_BTC {
                     if let Some(ref returned_addr) = status.address {
                         if !constant_time_compare(returned_addr.as_bytes(), escrow_addr.as_bytes()) {
+                            dummy_payment_check().await;
                             continue;
                         }
                     }
 
                     let _ = mark_order_funded(state, row_id, now).await;
                 } else if status.received {
+                    dummy_payment_check().await;
                 } else {
                     let expiry = data.expires_at.unwrap_or(now + 86400);
                     if now > expiry {
                         let _ = mark_order_cancelled(state, row_id).await;
+                    } else {
+                        dummy_payment_check().await;
                     }
                 }
             }
-            Err(_) => {}
+            Err(_) => dummy_payment_check().await,
         }
     }
 
@@ -168,6 +221,8 @@ async fn check_btc_payments(
 }
 
 async fn mark_order_funded(state: &Arc<AppState>, order_id: &[u8], now: i64) -> anyhow::Result<()> {
+    let worker_key = state.worker_key.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("worker_key not set"))?;
     let order = sqlx::query_as::<_, Order>(
         "SELECT * FROM orders WHERE id = ?1"
     )
@@ -176,7 +231,7 @@ async fn mark_order_funded(state: &Arc<AppState>, order_id: &[u8], now: i64) -> 
     .await?
     .ok_or_else(|| anyhow::anyhow!("order not found"))?;
 
-    let raw = oblivious::decrypt_order_blob(&order.encrypted_order_blob, &state.master_seed[..], &order.id)
+    let raw = oblivious::decrypt_order_blob(&order.encrypted_order_blob, worker_key, &order.id)
         .ok_or_else(|| anyhow::anyhow!("decrypt failed"))?;
     let mut data: OrderData = serde_json::from_slice(&raw)
         .map_err(|e| anyhow::anyhow!("parse failed: {e}"))?;
@@ -188,8 +243,11 @@ async fn mark_order_funded(state: &Arc<AppState>, order_id: &[u8], now: i64) -> 
     data.state = "funded".to_string();
     data.funded_at = Some(now);
 
+    // Notify WebSocket subscribers
+    let _ = state.payment_tx.send(hex::encode(order_id));
+
     let json = serde_json::to_vec(&data)?;
-    let new_blob = oblivious::encrypt_order_blob(&json, &state.master_seed[..], order_id)
+    let new_blob = oblivious::encrypt_order_blob(&json, worker_key, order_id)
         .ok_or_else(|| anyhow::anyhow!("Encryption failed"))?;
     let expiry_bucket = data.expires_at.map(floor_timestamp_6h);
 
@@ -211,6 +269,8 @@ async fn mark_order_funded(state: &Arc<AppState>, order_id: &[u8], now: i64) -> 
 }
 
 async fn mark_order_cancelled(state: &Arc<AppState>, order_id: &[u8]) -> anyhow::Result<()> {
+    let worker_key = state.worker_key.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("worker_key not set"))?;
     let order = sqlx::query_as::<_, Order>(
         "SELECT * FROM orders WHERE id = ?1"
     )
@@ -219,7 +279,7 @@ async fn mark_order_cancelled(state: &Arc<AppState>, order_id: &[u8]) -> anyhow:
     .await?
     .ok_or_else(|| anyhow::anyhow!("order not found"))?;
 
-    let raw = oblivious::decrypt_order_blob(&order.encrypted_order_blob, &state.master_seed[..], &order.id)
+    let raw = oblivious::decrypt_order_blob(&order.encrypted_order_blob, worker_key, &order.id)
         .ok_or_else(|| anyhow::anyhow!("decrypt failed"))?;
     let mut data: OrderData = serde_json::from_slice(&raw)
         .map_err(|e| anyhow::anyhow!("parse failed: {e}"))?;
@@ -231,7 +291,7 @@ async fn mark_order_cancelled(state: &Arc<AppState>, order_id: &[u8]) -> anyhow:
     data.state = "cancelled".to_string();
 
     let json = serde_json::to_vec(&data)?;
-    let new_blob = oblivious::encrypt_order_blob(&json, &state.master_seed[..], order_id)
+    let new_blob = oblivious::encrypt_order_blob(&json, worker_key, order_id)
         .ok_or_else(|| anyhow::anyhow!("Encryption failed"))?;
 
     let result = sqlx::query(
@@ -245,6 +305,51 @@ async fn mark_order_cancelled(state: &Arc<AppState>, order_id: &[u8]) -> anyhow:
 
     if result.rows_affected() == 0 {
         return Err(anyhow::anyhow!("order modified by concurrent writer"));
+    }
+
+    Ok(())
+}
+
+async fn retry_btc_settlement(state: &Arc<AppState>, order_id: &[u8]) -> anyhow::Result<()> {
+    let worker_key = state.worker_key.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("worker_key not set"))?;
+    let order = sqlx::query_as::<_, Order>(
+        "SELECT * FROM orders WHERE id = ?1"
+    )
+    .bind(order_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("order not found"))?;
+
+    let raw = oblivious::decrypt_order_blob(&order.encrypted_order_blob, worker_key, &order.id)
+        .ok_or_else(|| anyhow::anyhow!("decrypt failed"))?;
+    let mut data: OrderData = serde_json::from_slice(&raw)
+        .map_err(|e| anyhow::anyhow!("parse failed: {e}"))?;
+
+    if data.state != "released" || data.settlement_txid.is_some() {
+        return Ok(());
+    }
+
+    let btc_http = state.socks_pool.get_client(b"btc-settlement-worker").await;
+    if crate::services::payments::stealth_escrow::settle_stealth_order(state, btc_http, order_id, &mut data).await.is_err() {
+        return Ok(()); // retry next cycle
+    }
+
+    if data.settlement_txid.is_some() {
+        let json = serde_json::to_vec(&data)?;
+        let new_blob = oblivious::encrypt_order_blob(&json, worker_key, order_id)
+            .ok_or_else(|| anyhow::anyhow!("Encryption failed"))?;
+        let expiry_bucket = data.expires_at.map(floor_timestamp_6h);
+
+        sqlx::query(
+            "UPDATE orders SET encrypted_order_blob = ?1, expiry_bucket = ?2, version = version + 1 WHERE id = ?3 AND version = ?4"
+        )
+        .bind(&new_blob)
+        .bind(expiry_bucket)
+        .bind(order_id)
+        .bind(order.version)
+        .execute(&state.pool)
+        .await?;
     }
 
     Ok(())
@@ -298,7 +403,7 @@ fn parse_xmr_amount_safe(amount_str: &str) -> u64 {
     let amount_str = amount_str.trim();
 
     if amount_str.contains('e') || amount_str.contains('E') {
-        let mut parts = amount_str.split(|c| c == 'e' || c == 'E');
+        let mut parts = amount_str.split(['e', 'E']);
         let mantissa_str = parts.next().unwrap_or("");
         let exponent_str = parts.next().unwrap_or("0");
         let mantissa_piconero = parse_decimal_string_to_int(mantissa_str, 12);
@@ -347,16 +452,21 @@ pub async fn create_escrow_address(state: &Arc<AppState>, order_id: &str) -> any
 
 async fn get_or_init_xmr_client(state: &Arc<AppState>) -> MoneroViewOnlyClient {
     let mut guard = state.xmr_client.lock().await;
-    guard.get_or_insert_with(|| MoneroViewOnlyClient::new(state.config.monero.clone())).clone()
+    if guard.is_none() {
+        let http = state.socks_pool.get_client(b"xmr-payment-worker").await;
+        *guard = Some(MoneroViewOnlyClient::new(state.config.monero.clone(), http));
+    }
+    guard.clone().expect("just initialized")
 }
 
-async fn get_or_init_btc_client(state: &Arc<AppState>) -> anyhow::Result<BtcPaymentClient> {
+async fn get_or_init_btc_client(state: &Arc<AppState>) -> BtcPaymentClient {
     let mut guard = state.btc_client.lock().await;
     if guard.is_none() {
-        *guard = Some(BtcPaymentClient::new(state.config.bitcoin.clone())?);
+        let http = state.socks_pool.get_client(b"btc-payment-worker").await;
+        *guard = Some(BtcPaymentClient::new(state.config.bitcoin.clone(), http));
     }
     guard.clone()
-        .ok_or_else(|| anyhow::anyhow!("btc_client not initialized after init attempt"))
+        .expect("just initialized")
 }
 
 #[cfg(test)]

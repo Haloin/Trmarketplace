@@ -1,55 +1,54 @@
 #[cfg(test)]
 mod tests {
-    use tor_marketplace::crypto::encryption::EncryptionKey;
+    use tor_marketplace::crypto::zk;
     use tor_marketplace::crypto::wallet::WalletVerifier;
     use tor_marketplace::crypto::hash;
 
     #[test]
     fn test_encryption_roundtrip() {
-        let key = EncryptionKey::generate();
+        let kek = zk::KeyEncryptionKey::new();
         let plaintext = b"Hello, marketplace! This is a secret message with some length to it.";
-        let encrypted = key.encrypt(plaintext).unwrap();
-        let decrypted = key.decrypt(&encrypted).unwrap();
+        let encrypted = zk::encrypt_test(plaintext, &kek).unwrap();
+        let decrypted = zk::decrypt_test(&encrypted, &kek).unwrap();
         assert_eq!(&decrypted, plaintext);
     }
 
     #[test]
     fn test_encryption_large_payload() {
-        let key = EncryptionKey::generate();
-        let plaintext = vec![0xABu8; 10240]; // 10KB
-        let encrypted = key.encrypt(&plaintext).unwrap();
-        let decrypted = key.decrypt(&encrypted).unwrap();
+        let kek = zk::KeyEncryptionKey::new();
+        let plaintext = vec![0xABu8; 10240];
+        let encrypted = zk::encrypt_test(&plaintext, &kek).unwrap();
+        let decrypted = zk::decrypt_test(&encrypted, &kek).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
     #[test]
     fn test_encryption_empty() {
-        let key = EncryptionKey::generate();
-        let encrypted = key.encrypt(b"").unwrap();
-        let decrypted = key.decrypt(&encrypted).unwrap();
+        let kek = zk::KeyEncryptionKey::new();
+        let encrypted = zk::encrypt_test(b"", &kek).unwrap();
+        let decrypted = zk::decrypt_test(&encrypted, &kek).unwrap();
         assert_eq!(decrypted.len(), 0);
     }
 
     #[test]
     fn test_encryption_different_keys_fail() {
-        let key1 = EncryptionKey::generate();
-        let key2 = EncryptionKey::generate();
+        let kek1 = zk::KeyEncryptionKey::new();
+        let kek2 = zk::KeyEncryptionKey::new();
         let plaintext = b"Secret data";
-        let encrypted = key1.encrypt(plaintext).unwrap();
-        let result = key2.decrypt(&encrypted);
+        let encrypted = zk::encrypt_test(plaintext, &kek1).unwrap();
+        let result = zk::decrypt_test(&encrypted, &kek2);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_encryption_tampered_ciphertext_fails() {
-        let key = EncryptionKey::generate();
+        let kek = zk::KeyEncryptionKey::new();
         let plaintext = b"Important message";
-        let mut encrypted = key.encrypt(plaintext).unwrap();
-        // Flip a bit in the ciphertext
+        let mut encrypted = zk::encrypt_test(plaintext, &kek).unwrap();
         if let Some(byte) = encrypted.last_mut() {
             *byte ^= 0x01;
         }
-        let result = key.decrypt(&encrypted);
+        let result = zk::decrypt_test(&encrypted, &kek);
         assert!(result.is_err());
     }
 

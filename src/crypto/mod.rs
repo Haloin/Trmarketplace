@@ -1,8 +1,12 @@
 pub mod wallet;
-pub mod encryption;
 pub mod hash;
 pub mod zk;
 pub mod client;
 pub mod escrow;
 pub mod hmac_auth;
 pub mod oblivious;
+pub mod stealth;
+pub mod transition_sig;
+pub mod blind_sig;
+pub mod differential_privacy;
+pub mod worker_pubkey;

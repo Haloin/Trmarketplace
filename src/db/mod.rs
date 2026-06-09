@@ -67,6 +67,24 @@ pub async fn run_sqlite_migrations(pool: &SqlitePool) -> Result<()> {
     if db_version < 12 {
         run_migration_v12(pool).await?;
     }
+    if db_version < 13 {
+        run_migration_v13(pool).await?;
+    }
+    if db_version < 14 {
+        run_migration_v14(pool).await?;
+    }
+    if db_version < 15 {
+        run_migration_v15(pool).await?;
+    }
+    if db_version < 16 {
+        run_migration_v16(pool).await?;
+    }
+    if db_version < 17 {
+        run_migration_v17(pool).await?;
+    }
+    if db_version < 18 {
+        run_migration_v18(pool).await?;
+    }
 
     Ok(())
 }
@@ -638,6 +656,149 @@ async fn run_migration_v12(pool: &SqlitePool) -> Result<()> {
     .bind(12i64)
     .bind(now)
     .bind("Added version column to orders for TOCTOU guard on concurrent writes")
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn run_migration_v13(pool: &SqlitePool) -> Result<()> {
+    let now = crate::crypto::zk::floor_timestamp_6h(time::OffsetDateTime::now_utc().unix_timestamp());
+
+    if !column_exists(pool, "orders", "has_dispute").await {
+        sqlx::query("ALTER TABLE orders ADD COLUMN has_dispute INTEGER NOT NULL DEFAULT 0")
+            .execute(pool).await?;
+    }
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_orders_has_dispute ON orders(has_dispute)")
+        .execute(pool).await?;
+
+    sqlx::query(
+        "INSERT INTO schema_migrations (version, applied_at, description) VALUES (?1, ?2, ?3)"
+    )
+    .bind(13i64)
+    .bind(now)
+    .bind("Added has_dispute column to orders (prevents full-table scans for dispute lookups)")
+    .execute(pool).await?;
+
+    Ok(())
+}
+
+async fn run_migration_v14(pool: &SqlitePool) -> Result<()> {
+    let now = crate::crypto::zk::floor_timestamp_6h(time::OffsetDateTime::now_utc().unix_timestamp());
+
+    if !column_exists(pool, "listings", "status").await {
+        sqlx::query("ALTER TABLE listings ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            .execute(pool).await?;
+    }
+
+    if !column_exists(pool, "listings", "currency").await {
+        sqlx::query("ALTER TABLE listings ADD COLUMN currency TEXT NOT NULL DEFAULT 'XMR'")
+            .execute(pool).await?;
+    }
+
+    if !column_exists(pool, "listings", "version").await {
+        sqlx::query("ALTER TABLE listings ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+            .execute(pool).await?;
+    }
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_listings_status ON listings(status)")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_listings_currency ON listings(currency)")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_listings_status_currency ON listings(status, currency)")
+        .execute(pool).await?;
+
+    sqlx::query(
+        "INSERT INTO schema_migrations (version, applied_at, description) VALUES (?1, ?2, ?3)"
+    )
+    .bind(14i64)
+    .bind(now)
+    .bind("Added status, currency, version columns to listings with indexes")
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn run_migration_v15(pool: &SqlitePool) -> Result<()> {
+    let now = crate::crypto::zk::floor_timestamp_6h(time::OffsetDateTime::now_utc().unix_timestamp());
+
+    if !column_exists(pool, "orders", "client_encrypted_blob").await {
+        sqlx::query("ALTER TABLE orders ADD COLUMN client_encrypted_blob BLOB DEFAULT NULL")
+            .execute(pool).await?;
+    }
+
+    sqlx::query(
+        "INSERT INTO schema_migrations (version, applied_at, description) VALUES (?1, ?2, ?3)"
+    )
+    .bind(15i64)
+    .bind(now)
+    .bind("Added client_encrypted_blob to orders for E2E client-side encryption")
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn run_migration_v16(pool: &SqlitePool) -> Result<()> {
+    let now = crate::crypto::zk::floor_timestamp_6h(time::OffsetDateTime::now_utc().unix_timestamp());
+
+    if !column_exists(pool, "orders", "dispute_client_blob").await {
+        sqlx::query("ALTER TABLE orders ADD COLUMN dispute_client_blob BLOB DEFAULT NULL")
+            .execute(pool).await?;
+    }
+
+    sqlx::query(
+        "INSERT INTO schema_migrations (version, applied_at, description) VALUES (?1, ?2, ?3)"
+    )
+    .bind(16i64)
+    .bind(now)
+    .bind("Added dispute_client_blob to orders for E2E dispute encryption")
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn run_migration_v17(pool: &SqlitePool) -> Result<()> {
+    let now = crate::crypto::zk::floor_timestamp_6h(time::OffsetDateTime::now_utc().unix_timestamp());
+
+    if !column_exists(pool, "orders", "chat_encrypted_blob").await {
+        sqlx::query("ALTER TABLE orders ADD COLUMN chat_encrypted_blob BLOB DEFAULT NULL")
+            .execute(pool).await?;
+    }
+
+    sqlx::query(
+        "INSERT INTO schema_migrations (version, applied_at, description) VALUES (?1, ?2, ?3)"
+    )
+    .bind(17i64)
+    .bind(now)
+    .bind("Added chat_encrypted_blob to orders for E2E chat encryption")
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn run_migration_v18(pool: &SqlitePool) -> Result<()> {
+    let now = crate::crypto::zk::floor_timestamp_6h(time::OffsetDateTime::now_utc().unix_timestamp());
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS notification_tracker (
+            tx_hash BLOB PRIMARY KEY,
+            order_id BLOB NOT NULL,
+            buyer_pubkey BLOB NOT NULL,
+            processed_at INTEGER NOT NULL
+        )"
+    ).execute(pool).await?;
+
+    sqlx::query(
+        "INSERT INTO schema_migrations (version, applied_at, description) VALUES (?1, ?2, ?3)"
+    )
+    .bind(18i64)
+    .bind(now)
+    .bind("Added notification_tracker table for OP_RETURN notification scanning")
     .execute(pool)
     .await?;
 

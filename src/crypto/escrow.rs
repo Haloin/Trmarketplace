@@ -27,6 +27,23 @@ pub fn derive_order_key(master_seed: &[u8; MASTER_SEED_SIZE], order_id: &[u8]) -
         .map_err(|e| anyhow!("Invalid derived key: {}", e))
 }
 
+/// Derive a domain-specific 32-byte key from the master seed.
+///
+/// Uses HMAC-SHA256(seed, "domain:" || domain) for key separation.
+/// Each domain (auth, orders, chat, disputes) gets an independent key
+/// so that compromise of one domain key does not affect others.
+pub fn derive_domain_key(seed: &[u8; MASTER_SEED_SIZE], domain: &str) -> [u8; 32] {
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(seed)
+        .expect("HMAC key length is valid for SHA-256");
+    mac.update(b"domain:");
+    mac.update(domain.as_bytes());
+    let result = mac.finalize().into_bytes();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&result);
+    key
+}
+
 /// Get the secp256k1 public key corresponding to a private key.
 pub fn order_public_key(sk: &secp256k1::SecretKey) -> secp256k1::PublicKey {
     let secp = secp256k1::Secp256k1::signing_only();
@@ -157,6 +174,31 @@ mod tests {
 
         let encrypted = encrypt_master_seed(&seed, &kek1).unwrap();
         assert!(decrypt_master_seed(&encrypted, &kek2).is_err());
+    }
+
+    #[test]
+    fn test_derive_domain_key_deterministic() {
+        let seed = generate_master_seed();
+        let k1 = derive_domain_key(&seed, "auth");
+        let k2 = derive_domain_key(&seed, "auth");
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn test_derive_domain_key_different_domains_differ() {
+        let seed = generate_master_seed();
+        let auth_key = derive_domain_key(&seed, "auth");
+        let orders_key = derive_domain_key(&seed, "orders");
+        assert_ne!(auth_key, orders_key);
+    }
+
+    #[test]
+    fn test_derive_domain_key_different_seeds_differ() {
+        let s1 = generate_master_seed();
+        let s2 = generate_master_seed();
+        let k1 = derive_domain_key(&s1, "chat");
+        let k2 = derive_domain_key(&s2, "chat");
+        assert_ne!(k1, k2);
     }
 
     #[test]

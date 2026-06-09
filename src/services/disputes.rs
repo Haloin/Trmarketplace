@@ -1,390 +1,342 @@
+//! Disputes service — blind pass-through for opaque dispute blobs.
+
 use axum::{
-    extract::{Path, State, Extension, Query},
-    Json, Router,
+    extract::{Path, State, Extension, Json},
+    Router,
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
-use crate::db::models::{Order, OrderData, DisputeData, DisputeEvidenceEntry};
-use crate::crypto::oblivious;
-use crate::crypto::hmac_auth::{derive_domain_identity, domains};
-use crate::crypto::zk::{constant_time_compare, floor_timestamp_6h};
 use crate::gateway::state::AppState;
 use crate::gateway::auth_common::AuthPubkey;
 use crate::error::AppError;
+use crate::crypto::blind_sig;
+use uuid::Uuid;
 
 #[derive(Deserialize)]
 pub struct OpenDisputeRequest {
     pub order_id: String,
-    pub reason: String,
+    /// Opaque client-encrypted dispute blob (base64). Server stores as-is.
+    pub client_encrypted_blob: String,
+    /// Hex-encoded ed25519 signature over (order_id, prev_version, new_blob_sha256, nonce).
+    pub transition_signature: String,
+    pub nonce: String,
 }
 
 #[derive(Deserialize)]
-pub struct SubmitEvidenceRequest {
-    pub encrypted_content: String,
-    pub content_type: String,
+pub struct UpdateDisputeRequest {
+    /// New opaque dispute blob (base64). Replaces the existing one.
+    pub client_encrypted_blob: String,
+    pub transition_signature: String,
+    pub nonce: String,
 }
 
 #[derive(Deserialize)]
 pub struct ResolveDisputeRequest {
-    pub resolution: String,
+    /// Admin's signed outcome blob.
+    pub outcome_blob: String,
+    pub admin_signature: String,
+    /// Random nonce for the request body (replay protection).
+    pub nonce: String,
+    /// Blinded RSA admin token signature (hex).
+    pub token_signature: Option<String>,
+    /// Token message hash that was blindly signed (hex).
+    pub token_message: Option<String>,
+    /// Nonce embedded in the token message.
+    pub token_nonce: Option<String>,
+    /// Hour bucket when the token was issued (±1 hour tolerance).
+    pub token_expiry_hour: Option<i64>,
 }
 
 #[derive(Serialize)]
 pub struct DisputeResponse {
     pub id: String,
     pub order_id: String,
-    pub opened_by: String,
-    pub reason: String,
-    pub resolution: Option<String>,
-    pub resolved_by: Option<String>,
-    pub resolved_at: Option<i64>,
-    pub created_at: i64,
-}
-
-#[derive(Serialize)]
-pub struct DisputeListResponse {
-    pub disputes: Vec<DisputeResponse>,
-    pub total: i64,
-}
-
-#[derive(Deserialize)]
-pub struct DisputeQuery {
-    pub state: Option<String>,
-    pub offset: Option<i64>,
-    pub limit: Option<i64>,
+    pub client_encrypted_blob: Option<String>,
+    pub version: i64,
+    pub has_dispute: bool,
 }
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/disputes", post(open_dispute))
-        .route("/disputes/{id}", get(get_dispute))
-        .route("/disputes/order/{order_id}", get(get_dispute_by_order))
-        .route("/disputes/{id}/evidence", post(submit_evidence))
-        .route("/disputes/{id}/resolve", post(resolve_dispute))
-        .route("/disputes", get(list_disputes))
+        .route("/disputes/:id", get(get_dispute))
+        .route("/disputes/:id/update", post(update_dispute))
+        .route("/disputes/:id/resolve", post(resolve_dispute))
 }
 
-fn order_domain_id(secret: &str, pk_hash: &[u8]) -> Result<Vec<u8>, AppError> {
-    derive_domain_identity(secret.as_bytes(), domains::ORDERS, pk_hash)
-        .ok_or_else(|| AppError::Internal("Domain identity derivation failed".into()))
-}
-
-fn to_response(order_id: &str, d: &DisputeData) -> DisputeResponse {
-    DisputeResponse {
-        id: d.id.clone(),
-        order_id: order_id.to_string(),
-        opened_by: d.opened_by.clone(),
-        reason: d.reason.clone(),
-        resolution: d.resolution.clone(),
-        resolved_by: d.resolved_by.clone(),
-        resolved_at: d.resolved_at,
-        created_at: d.created_at,
-    }
-}
-
-async fn read_order_data(state: &AppState, order_id: &str) -> Result<(Vec<u8>, OrderData, i64), AppError> {
-    let id_bytes = hex::decode(order_id)
-        .map_err(|_| AppError::BadRequest("Invalid id".into()))?;
-
-    let order = sqlx::query_as::<_, Order>(
-        "SELECT * FROM orders WHERE id = ?1"
-    )
-    .bind(&id_bytes)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
-    .ok_or_else(|| AppError::NotFound("Order not found".into()))?;
-
-    let raw = oblivious::decrypt_order_blob(&order.encrypted_order_blob, &state.master_seed[..], &order.id)
-        .ok_or_else(|| AppError::Internal("Failed to decrypt order".into()))?;
-    let data = serde_json::from_slice(&raw)
-        .map_err(|e| AppError::Internal(format!("Corrupt order data: {e}")))?;
-
-    Ok((order.id, data, order.version))
-}
-
-async fn write_order_data(state: &AppState, id: &[u8], data: &OrderData, version: i64) -> Result<(), AppError> {
-    let json = serde_json::to_vec(data)
-        .map_err(|e| AppError::Internal(format!("Serialize: {e}")))?;
-    let blob = oblivious::encrypt_order_blob(&json, &state.master_seed[..], id)
-        .ok_or_else(|| AppError::Internal("Encryption failed".into()))?;
-    let expiry_bucket = data.expires_at.map(floor_timestamp_6h);
-    let result = sqlx::query(
-        "UPDATE orders SET encrypted_order_blob = ?1, expiry_bucket = ?2, version = version + 1 WHERE id = ?3 AND version = ?4"
-    )
-        .bind(&blob)
-        .bind(expiry_bucket)
-        .bind(id)
-        .bind(version)
-        .execute(&state.pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::Conflict("Order was modified by another request".into()));
-    }
-    Ok(())
-}
+const MAX_DISPUTE_BLOB_BYTES: usize = 512 * 1024;
 
 async fn open_dispute(
     State(state): State<AppState>,
-    Extension(AuthPubkey(pubkey_hash)): Extension<AuthPubkey>,
+    Extension(AuthPubkey(_pubkey_hash)): Extension<AuthPubkey>,
     Json(req): Json<OpenDisputeRequest>,
 ) -> Result<Json<DisputeResponse>, AppError> {
-    let now = floor_timestamp_6h(OffsetDateTime::now_utc().unix_timestamp());
-    let (row_id, mut data, version) = read_order_data(&state, &req.order_id).await?;
+    let order_id_bytes = hex::decode(&req.order_id)
+        .map_err(|_| AppError::BadRequest("Invalid order_id".into()))?;
 
-    let user_order_id = order_domain_id(&state.config.server.server_secret, &pubkey_hash)?;
-    if !constant_time_compare(&data.buyer_pubkey_hash, &user_order_id) {
-        return Err(AppError::Forbidden("Only buyer can open dispute".into()));
+    let blob = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.client_encrypted_blob)
+        .map_err(|e| AppError::BadRequest(format!("Invalid client_encrypted_blob base64: {e}")))?;
+    if blob.len() > MAX_DISPUTE_BLOB_BYTES {
+        return Err(AppError::BadRequest("dispute blob too large".into()));
     }
 
-    if !data.can_transition_to("disputed") {
-        return Err(AppError::BadRequest(
-            format!("Invalid state transition: {} -> disputed", data.state)
-        ));
+    if !check_dispute_nonce_replay(&req.order_id, &req.nonce) {
+        return Err(AppError::Conflict("Dispute nonce already used".into()));
     }
 
-    let dispute = DisputeData {
-        id: uuid::Uuid::new_v4().to_string(),
-        opened_by: hex::encode(&user_order_id),
-        reason: req.reason,
-        resolution: None,
-        resolved_by: None,
-        resolved_at: None,
-        created_at: now,
-        evidence: vec![],
+    let dispute_id = Uuid::new_v4().to_string();
+    let new_version: i64 = {
+        // TOCTOU: read current version, conditional update with bump.
+        let current: Option<(i64,)> = sqlx::query_as(
+            "SELECT version FROM orders WHERE id = ?1"
+        )
+        .bind(&order_id_bytes)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+        let v = match current {
+            Some((v,)) => v,
+            None => return Err(AppError::NotFound("Order not found".into())),
+        };
+        let result = sqlx::query(
+            "UPDATE orders SET dispute_client_blob = ?1, has_dispute = 1, version = version + 1 WHERE id = ?2 AND version = ?3"
+        )
+        .bind(&blob)
+        .bind(&order_id_bytes)
+        .bind(v)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::Conflict("Order was modified by another request".into()));
+        }
+        v + 1
     };
 
-    data.dispute = Some(dispute);
-    data.dispute_id = data.dispute.as_ref().map(|d| d.id.clone());
-    data.state = "disputed".to_string();
-    data.disputed_at = Some(now);
-
-    write_order_data(&state, &row_id, &data, version).await?;
-
-    let dispute = data.dispute.as_ref()
-        .ok_or_else(|| AppError::Internal("Dispute data missing".into()))?;
-    Ok(Json(to_response(&req.order_id, dispute)))
+    Ok(Json(DisputeResponse {
+        id: dispute_id,
+        order_id: req.order_id,
+        client_encrypted_blob: Some(req.client_encrypted_blob),
+        version: new_version,
+        has_dispute: true,
+    }))
 }
 
 async fn get_dispute(
     State(state): State<AppState>,
-    Extension(AuthPubkey(pubkey_hash)): Extension<AuthPubkey>,
+    Extension(AuthPubkey(_pubkey_hash)): Extension<AuthPubkey>,
     Path(id): Path<String>,
 ) -> Result<Json<DisputeResponse>, AppError> {
-    let disputes = scan_disputes(&state).await?;
-    let (d, order_id) = disputes.into_iter().find(|(d, _)| d.id == id)
+    // Disputes live on the orders row; path param is treated as order_id.
+    let order_id_bytes = hex::decode(&id)
+        .map_err(|_| AppError::BadRequest("Invalid id".into()))?;
+
+    let row: Option<(i64, Option<Vec<u8>>, i64)> = sqlx::query_as(
+        "SELECT version, dispute_client_blob, has_dispute FROM orders WHERE id = ?1"
+    )
+    .bind(&order_id_bytes)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    let (version, blob, has_dispute) = row
         .ok_or_else(|| AppError::NotFound("Dispute not found".into()))?;
 
-    let (_, data, _) = read_order_data(&state, &order_id).await?;
-    let user_order_id = order_domain_id(&state.config.server.server_secret, &pubkey_hash)?;
-    if !constant_time_compare(&data.buyer_pubkey_hash, &user_order_id)
-        && !constant_time_compare(&data.seller_pubkey_hash, &user_order_id)
-        && !is_admin(&state, &pubkey_hash).await
-    {
-        return Err(AppError::Forbidden("Not authorized".into()));
+    if has_dispute == 0 {
+        return Err(AppError::NotFound("No dispute for this order".into()));
     }
 
-    Ok(Json(to_response(&order_id, &d)))
+    let blob_b64 = blob.map(|b| {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b)
+    });
+
+    Ok(Json(DisputeResponse {
+        id,
+        order_id: hex::encode(&order_id_bytes),
+        client_encrypted_blob: blob_b64,
+        version,
+        has_dispute: true,
+    }))
 }
 
-async fn get_dispute_by_order(
+async fn update_dispute(
     State(state): State<AppState>,
-    Extension(AuthPubkey(pubkey_hash)): Extension<AuthPubkey>,
-    Path(order_id): Path<String>,
+    Extension(AuthPubkey(_pubkey_hash)): Extension<AuthPubkey>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateDisputeRequest>,
 ) -> Result<Json<DisputeResponse>, AppError> {
-    let (_, data, _) = read_order_data(&state, &order_id).await?;
+    let order_id_bytes = hex::decode(&id)
+        .map_err(|_| AppError::BadRequest("Invalid id".into()))?;
 
-    let user_order_id = order_domain_id(&state.config.server.server_secret, &pubkey_hash)?;
-    if !constant_time_compare(&data.buyer_pubkey_hash, &user_order_id)
-        && !constant_time_compare(&data.seller_pubkey_hash, &user_order_id)
-        && !is_admin(&state, &pubkey_hash).await
-    {
-        return Err(AppError::Forbidden("Not authorized".into()));
+    let blob = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.client_encrypted_blob)
+        .map_err(|e| AppError::BadRequest(format!("Invalid client_encrypted_blob base64: {e}")))?;
+    if blob.len() > MAX_DISPUTE_BLOB_BYTES {
+        return Err(AppError::BadRequest("dispute blob too large".into()));
     }
 
-    let dispute = data.dispute.as_ref()
-        .ok_or_else(|| AppError::NotFound("No dispute for this order".into()))?;
-
-    Ok(Json(to_response(&order_id, dispute)))
-}
-
-async fn submit_evidence(
-    State(state): State<AppState>,
-    Extension(AuthPubkey(pubkey_hash)): Extension<AuthPubkey>,
-    Path(dispute_id): Path<String>,
-    Json(req): Json<SubmitEvidenceRequest>,
-) -> Result<Json<DisputeResponse>, AppError> {
-    let now = floor_timestamp_6h(OffsetDateTime::now_utc().unix_timestamp());
-
-    let disputes = scan_disputes(&state).await?;
-    let (_, order_id) = disputes.into_iter().find(|(d, _)| d.id == dispute_id)
-        .ok_or_else(|| AppError::NotFound("Dispute not found".into()))?;
-
-    let (row_id, mut data, version) = read_order_data(&state, &order_id).await?;
-
-    let opened_by_hex;
-    let is_dispute_resolved;
-    let evidence_len;
-    {
-        let dispute = data.dispute.as_mut()
-            .ok_or_else(|| AppError::Internal("Dispute data missing".into()))?;
-        is_dispute_resolved = dispute.resolved_at.is_some();
-        opened_by_hex = dispute.opened_by.clone();
-        evidence_len = dispute.evidence.len();
+    if !check_dispute_nonce_replay(&id, &req.nonce) {
+        return Err(AppError::Conflict("Dispute nonce already used".into()));
     }
 
-    if is_dispute_resolved {
-        return Err(AppError::BadRequest("Dispute already resolved".into()));
+    let current: Option<(i64,)> = sqlx::query_as(
+        "SELECT version FROM orders WHERE id = ?1"
+    )
+    .bind(&order_id_bytes)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    let v = match current {
+        Some((v,)) => v,
+        None => return Err(AppError::NotFound("Dispute not found".into())),
+    };
+
+    let result = sqlx::query(
+        "UPDATE orders SET dispute_client_blob = ?1, version = version + 1 WHERE id = ?2 AND version = ?3"
+    )
+    .bind(&blob)
+    .bind(&order_id_bytes)
+    .bind(v)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::Conflict("Order was modified by another request".into()));
     }
 
-    let user_order_id = order_domain_id(&state.config.server.server_secret, &pubkey_hash)?;
-    if !constant_time_compare(&hex::decode(&opened_by_hex).unwrap_or_default(), &user_order_id)
-        && !constant_time_compare(&data.seller_pubkey_hash, &user_order_id)
-    {
-        return Err(AppError::Forbidden("Only buyer or seller can submit evidence".into()));
-    }
-
-    let content_bytes = hex::decode(&req.encrypted_content)
-        .map_err(|_| AppError::BadRequest("Invalid encrypted_content hex".into()))?;
-
-    const MAX_EVIDENCE: usize = 50;
-    if evidence_len >= MAX_EVIDENCE {
-        return Err(AppError::BadRequest("Maximum evidence submissions reached".into()));
-    }
-
-    {
-        let dispute = data.dispute.as_mut()
-            .ok_or_else(|| AppError::Internal("Dispute data missing".into()))?;
-        dispute.evidence.push(DisputeEvidenceEntry {
-            id: uuid::Uuid::new_v4().to_string(),
-            submitted_by: hex::encode(&user_order_id),
-            encrypted_content: content_bytes,
-            content_type: req.content_type,
-            created_at: now,
-        });
-    }
-
-    write_order_data(&state, &row_id, &data, version).await?;
-
-    let dispute = data.dispute.as_ref()
-        .ok_or_else(|| AppError::Internal("Dispute data missing".into()))?;
-    Ok(Json(to_response(&order_id, dispute)))
+    Ok(Json(DisputeResponse {
+        id: id.clone(),
+        order_id: id,
+        client_encrypted_blob: Some(req.client_encrypted_blob),
+        version: v + 1,
+        has_dispute: true,
+    }))
 }
 
 async fn resolve_dispute(
     State(state): State<AppState>,
-    Extension(AuthPubkey(pubkey_hash)): Extension<AuthPubkey>,
-    Path(dispute_id): Path<String>,
+    Path(id): Path<String>,
     Json(req): Json<ResolveDisputeRequest>,
 ) -> Result<Json<DisputeResponse>, AppError> {
-    let now = floor_timestamp_6h(OffsetDateTime::now_utc().unix_timestamp());
+    // Verify blind-signed admin token.
+    let admin_kp = state.admin_keypair.as_ref()
+        .ok_or_else(|| AppError::Internal("Admin keypair not configured".into()))?;
 
-    if !is_admin(&state, &pubkey_hash).await {
-        return Err(AppError::Forbidden("Only admin can resolve disputes".into()));
+    let sig_bytes = req.token_signature.as_ref()
+        .and_then(|s| hex::decode(s).ok())
+        .ok_or_else(|| AppError::BadRequest("Missing or invalid token_signature".into()))?;
+    let msg_bytes = req.token_message.as_ref()
+        .and_then(|s| hex::decode(s).ok())
+        .ok_or_else(|| AppError::BadRequest("Missing or invalid token_message".into()))?;
+    let token_nonce_hex = req.token_nonce.as_ref()
+        .ok_or_else(|| AppError::BadRequest("Missing token_nonce".into()))?;
+    let token_nonce_bytes = hex::decode(token_nonce_hex)
+        .map_err(|_| AppError::BadRequest("Invalid token_nonce hex".into()))?;
+    let token_expiry = req.token_expiry_hour
+        .ok_or_else(|| AppError::BadRequest("Missing token_expiry_hour".into()))?;
+
+    if msg_bytes.len() != 32 {
+        return Err(AppError::BadRequest("token_message must be 32 bytes".into()));
+    }
+    let mut msg_hash = [0u8; 32];
+    msg_hash.copy_from_slice(&msg_bytes);
+
+    // Reconstruct expected message from request context.
+    let expected = blind_sig::compose_token_message(
+        "dispute:resolve",
+        &id,
+        &token_nonce_bytes,
+        token_expiry as u64,
+    );
+    if msg_hash != expected {
+        return Err(AppError::Forbidden("Token message does not match request context".into()));
     }
 
-    let disputes = scan_disputes(&state).await?;
-    let (_, order_id) = disputes.into_iter().find(|(d, _)| d.id == dispute_id)
-        .ok_or_else(|| AppError::NotFound("Dispute not found".into()))?;
-
-    let (row_id, mut data, version) = read_order_data(&state, &order_id).await?;
-
-    let is_resolved;
-    {
-        let dispute = data.dispute.as_mut()
-            .ok_or_else(|| AppError::Internal("Dispute data missing".into()))?;
-        is_resolved = dispute.resolved_at.is_some();
+    // Verify the RSA blind signature.
+    if !blind_sig::verify_token(&msg_hash, &sig_bytes, &admin_kp.public) {
+        return Err(AppError::Forbidden("Invalid admin token signature".into()));
     }
 
-    if is_resolved {
-        return Err(AppError::BadRequest("Dispute already resolved".into()));
+    // Check token expiry (±1 hour tolerance for clock skew).
+    let now_hour = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() / 3600) as i64;
+    if (token_expiry - now_hour).abs() > 1 {
+        return Err(AppError::Forbidden("Admin token expired or not yet valid".into()));
     }
 
-    if req.resolution != "release" && req.resolution != "refund" {
-        return Err(AppError::BadRequest("Resolution must be 'release' or 'refund'".into()));
+    // Check token nonce replay (in-process cache).
+    if !check_admin_token_replay(&id, token_nonce_hex) {
+        return Err(AppError::Conflict("Admin token nonce already used".into()));
     }
 
-    {
-        let dispute = data.dispute.as_mut()
-            .ok_or_else(|| AppError::Internal("Dispute data missing".into()))?;
-        dispute.resolution = Some(req.resolution.clone());
-        let admin_order_id = order_domain_id(&state.config.server.server_secret, &pubkey_hash)?;
-        dispute.resolved_by = Some(hex::encode(&admin_order_id));
-        dispute.resolved_at = Some(now);
+    let order_id_bytes = hex::decode(&id)
+        .map_err(|_| AppError::BadRequest("Invalid id".into()))?;
+
+    let outcome = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &req.outcome_blob)
+        .map_err(|e| AppError::BadRequest(format!("Invalid outcome_blob base64: {e}")))?;
+    if outcome.len() > MAX_DISPUTE_BLOB_BYTES {
+        return Err(AppError::BadRequest("outcome blob too large".into()));
     }
 
-    if req.resolution == "release" {
-        data.state = "released".to_string();
-        data.released_at = Some(now);
-    } else {
-        data.state = "refunded".to_string();
-        data.refunded_at = Some(now);
-    }
-    data.dispute_id = None;
-    data.disputed_at = None;
-
-    write_order_data(&state, &row_id, &data, version).await?;
-
-    let dispute = data.dispute.as_ref()
-        .ok_or_else(|| AppError::Internal("Dispute data missing".into()))?;
-    Ok(Json(to_response(&order_id, dispute)))
-}
-
-async fn list_disputes(
-    State(state): State<AppState>,
-    Extension(AuthPubkey(pubkey_hash)): Extension<AuthPubkey>,
-    Query(query): Query<DisputeQuery>,
-) -> Result<Json<DisputeListResponse>, AppError> {
-    if !is_admin(&state, &pubkey_hash).await {
-        return Err(AppError::Forbidden("Only admin can list all disputes".into()));
-    }
-
-    let offset = query.offset.unwrap_or(0) as usize;
-    let limit = query.limit.unwrap_or(50).min(100) as usize;
-    let filter_state = query.state.as_deref();
-
-    let all = scan_disputes(&state).await?;
-
-    let filtered: Vec<_> = match filter_state {
-        Some("open") => all.into_iter().filter(|(d, _)| d.resolved_at.is_none()).collect(),
-        Some("resolved") => all.into_iter().filter(|(d, _)| d.resolved_at.is_some()).collect(),
-        _ => all,
+    // The outcome blob is stored in dispute_client_blob. The worker (which
+    // holds worker_key) reads it, decodes the admin's intent, and applies
+    // the state transition. The API just records the resolution.
+    let current: Option<(i64,)> = sqlx::query_as(
+        "SELECT version FROM orders WHERE id = ?1"
+    )
+    .bind(&order_id_bytes)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    let v = match current {
+        Some((v,)) => v,
+        None => return Err(AppError::NotFound("Dispute not found".into())),
     };
 
-    let total = filtered.len() as i64;
-    let disputes: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
+    let result = sqlx::query(
+        "UPDATE orders SET dispute_client_blob = ?1, has_dispute = 0, version = version + 1 WHERE id = ?2 AND version = ?3"
+    )
+    .bind(&outcome)
+    .bind(&order_id_bytes)
+    .bind(v)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::Conflict("Order was modified by another request".into()));
+    }
 
-    Ok(Json(DisputeListResponse {
-        disputes: disputes.into_iter().map(|(d, oid)| to_response(&oid, &d)).collect(),
-        total,
+    tracing::info!(order_id = %id, "Dispute resolved by admin");
+
+    Ok(Json(DisputeResponse {
+        id: id.clone(),
+        order_id: id,
+        client_encrypted_blob: Some(req.outcome_blob),
+        version: v + 1,
+        has_dispute: false,
     }))
 }
 
-async fn scan_disputes(state: &AppState) -> Result<Vec<(DisputeData, String)>, AppError> {
-    let orders = sqlx::query_as::<_, Order>(
-        "SELECT * FROM orders"
-    )
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+fn check_dispute_nonce_replay(order_id: &str, nonce: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use once_cell::sync::Lazy;
 
-    let mut result = Vec::new();
-    for order in orders {
-        if let Some(raw) = oblivious::decrypt_order_blob(&order.encrypted_order_blob, &state.master_seed[..], &order.id) {
-            if let Ok(data) = serde_json::from_slice::<OrderData>(&raw) {
-                if let Some(dispute) = data.dispute {
-                    result.push((dispute, hex::encode(&order.id)));
-                }
-            }
-        }
-    }
-
-    Ok(result)
+    static DISPUTE_NONCES: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+    let key = format!("{}:{}", order_id, nonce);
+    let mut set = DISPUTE_NONCES.lock().unwrap_or_else(|e| e.into_inner());
+    set.insert(key)
 }
 
-async fn is_admin(state: &AppState, pubkey_hash: &[u8]) -> bool {
-    crate::gateway::auth_common::is_admin(&state.config, pubkey_hash)
+fn check_admin_token_replay(action_id: &str, nonce: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use once_cell::sync::Lazy;
+
+    static ADMIN_TOKEN_NONCES: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+    let key = format!("{}:{}", action_id, nonce);
+    let mut set = ADMIN_TOKEN_NONCES.lock().unwrap_or_else(|e| e.into_inner());
+    set.insert(key)
 }

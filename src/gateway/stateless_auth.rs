@@ -12,11 +12,15 @@ use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
 
 use crate::crypto::hash::hash_pubkey;
-use crate::gateway::auth_common::{self, AuthPubkey};
+use crate::gateway::auth_common::{self, AuthPubkey, AuthPubkeyBytes};
 use crate::gateway::state::AppState;
 use crate::error::AppError;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Maximum nonces stored per hourly bucket.
+/// Beyond this limit, the entire bucket is cleared to prevent memory exhaustion.
+const MAX_NONCES_PER_BUCKET: usize = 10_000;
 
 static REPLAY_CACHE: Lazy<Mutex<HashMap<u64, HashSet<Vec<u8>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -62,8 +66,16 @@ fn verify_signature(pk_bytes: &[u8; 32], hmac: &[u8], pubkey: &[u8], hour_bucket
 
 fn check_replay(hour_bucket: u64, nonce: &[u8]) -> bool {
     let mut cache = REPLAY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    // Drop stale buckets older than 1 hour
     cache.retain(|&bucket, _| bucket >= hour_bucket.saturating_sub(1));
-    let entry = cache.entry(hour_bucket).or_insert_with(HashSet::new);
+    let entry = cache.entry(hour_bucket).or_default();
+    // Bucket overflow guard: if this bucket already holds too many nonces,
+    // clear it to prevent memory exhaustion. An attacker who floods nonces
+    // within the same hour bucket will cause older legitimate nonces to be
+    // forgotten (hardenable via LRU if needed in future).
+    if entry.len() >= MAX_NONCES_PER_BUCKET {
+        entry.clear();
+    }
     entry.insert(nonce.to_vec())
 }
 
@@ -74,7 +86,10 @@ pub async fn stateless_auth_middleware(
 ) -> Response {
     let path = request.uri().path().to_string();
 
-    if path.starts_with("/auth/") || path.starts_with("/api/auth/") {
+    if path.starts_with("/auth/")
+        || path.starts_with("/api/auth/")
+        || path.starts_with("/public/")
+    {
         return next.run(request).await;
     }
 
@@ -153,6 +168,10 @@ pub async fn stateless_auth_middleware(
 
     let pubkey_hash = hash_pubkey(&pk_bytes);
     request.extensions_mut().insert(AuthPubkey(pubkey_hash.to_vec()));
+    // Also store the full pubkey bytes so handlers can verify
+    // transition signatures without re-reading headers. The hash alone
+    // is insufficient for ed25519 signature verification.
+    request.extensions_mut().insert(AuthPubkeyBytes(pk_array));
 
     next.run(request).await
 }

@@ -3,7 +3,7 @@ pub mod listings;
 pub mod orders;
 pub mod payments;
 pub mod chat;
-pub mod search;
 pub mod admin;
 pub mod disputes;
 pub mod escrow;
+pub mod public;

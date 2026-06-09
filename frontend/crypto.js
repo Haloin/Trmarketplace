@@ -1,16 +1,16 @@
-// Client-side crypto using tweetnacl
-// Provides Ed25519 key generation, signing, and E2E encryption
-// With password-derived key wrapping (PBKDF2 + XSalsa20-Poly1305)
-
+// Client-side crypto: WASM (ChaCha20/X25519) + tweetnacl (Ed25519 auth)
 const CRYPTO = (() => {
+  let wasm = null;
+  let wasmInit = null;
   let keypair = null;
   let hasWrappedKey = false;
 
-  // IndexedDB wrapper for secure key storage
   const DB_NAME = 'tor_marketplace_keys';
   const STORE_NAME = 'keyvault';
   const LISTING_KEYS_STORE = 'listing_keys';
-  const DB_VERSION = 2;
+  const ORDER_STATE_STORE = 'order_state';
+  const SEARCH_KEY_ID = 'search_key';
+  const DB_VERSION = 3;
 
   function openDB() {
     return new Promise((resolve, reject) => {
@@ -25,417 +25,331 @@ const CRYPTO = (() => {
         if (!db.objectStoreNames.contains(LISTING_KEYS_STORE)) {
           db.createObjectStore(LISTING_KEYS_STORE, { keyPath: 'id' });
         }
+        if (!db.objectStoreNames.contains(ORDER_STATE_STORE)) {
+          db.createObjectStore(ORDER_STATE_STORE, { keyPath: 'id' });
+        }
       };
     });
   }
 
-  async function dbGet(key) {
+  async function dbGet(store, key) {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const store = tx.objectStore(STORE_NAME);
-      const request = store.get(key);
-      request.onsuccess = () => resolve(request.result?.value);
-      request.onerror = () => reject(request.error);
+      const tx = db.transaction(store, 'readonly');
+      const req = tx.objectStore(store).get(key);
+      req.onsuccess = () => resolve(req.result?.value);
+      req.onerror = () => reject(req.error);
     });
   }
 
-  async function dbPut(key, value) {
+  async function dbPut(store, key, value) {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
-      const request = store.put({ id: key, value });
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
+      const tx = db.transaction(store, 'readwrite');
+      const req = tx.objectStore(store).put({ id: key, value });
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
     });
   }
 
-  async function dbDelete(key) {
+  async function dbDelete(store, key) {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
-      const request = store.delete(key);
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
+      const tx = db.transaction(store, 'readwrite');
+      const req = tx.objectStore(store).delete(key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
     });
   }
 
-  async function dbGetAllListingKeys() {
-    const db = await openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(LISTING_KEYS_STORE, 'readonly');
-      const store = tx.objectStore(LISTING_KEYS_STORE);
-      const request = store.getAll();
-      request.onsuccess = () => {
-        const result = {};
-        request.result.forEach(item => { result[item.id] = item.value; });
-        resolve(result);
-      };
-      request.onerror = () => reject(request.error);
-    });
-  }
-
-  async function dbPutListingKey(listingId, key) {
-    const db = await openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(LISTING_KEYS_STORE, 'readwrite');
-      const store = tx.objectStore(LISTING_KEYS_STORE);
-      const request = store.put({ id: listingId, value: key });
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
-    });
-  }
-
-  // PBKDF2 key derivation (using Web Crypto API)
-  async function deriveKey(password, salt) {
-    const encoder = new TextEncoder();
-    const keyMaterial = await crypto.subtle.importKey(
-      'raw',
-      encoder.encode(password),
-      'PBKDF2',
-      false,
-      ['deriveKey']
-    );
-    return await crypto.subtle.deriveKey(
-      {
-        name: 'PBKDF2',
-        salt: salt,
-        iterations: 600000,
-        hash: 'SHA-256'
-      },
-      keyMaterial,
-      { name: 'AES-GCM', length: 256 },
-      false,
-      ['encrypt', 'decrypt']
-    );
-  }
-
-  // Wrap (encrypt) the secret key
-  async function wrapKey(seckey, password) {
-    const salt = crypto.getRandomValues(new Uint8Array(16));
-    const key = await deriveKey(password, salt);
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    
-    const encrypted = await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv: iv },
-      key,
-      seckey
-    );
-    
-    // Format: salt (16) + iv (12) + encrypted
-    const result = new Uint8Array(16 + 12 + encrypted.byteLength);
-    result.set(salt, 0);
-    result.set(iv, 16);
-    result.set(new Uint8Array(encrypted), 28);
-    
-    return u8ToBase64(result);
-  }
-
-  // Unwrap (decrypt) the secret key
-  async function unwrapKey(wrappedBase64, password) {
-    try {
-      const data = base64ToU8(wrappedBase64);
-      const salt = data.slice(0, 16);
-      const iv = data.slice(16, 28);
-      const encrypted = data.slice(28);
-      
-      const key = await deriveKey(password, salt);
-      
-      const decrypted = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: iv },
-        key,
-        encrypted
-      );
-      
-      return new Uint8Array(decrypted);
-    } catch (e) {
-      return null; // Wrong password or corrupted data
+  async function initWasm() {
+    if (!wasmInit) {
+      wasmInit = (async () => {
+        const mod = await import('/wasm/tor_marketplace_wasm.js');
+        await mod.default();
+        wasm = mod;
+      })();
     }
+    await wasmInit;
+    return wasm;
   }
 
-  // Check if wrapped key exists in IndexedDB
-  async function hasStoredKey() {
-    try {
-      const wrapped = await dbGet('wrapped_key');
-      hasWrappedKey = !!wrapped;
-      return hasWrappedKey;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  // Unlock with password
-  async function unlockWithPassword(password) {
-    if (!password || password.length < 12) {
-      throw new Error('Password must be at least 12 characters');
-    }
-    
-    const wrapped = await dbGet('wrapped_key');
-    if (!wrapped) {
-      throw new Error('No stored key found');
-    }
-    
-    const seckey = await unwrapKey(wrapped, password);
-    if (!seckey) {
-      throw new Error('Invalid password');
-    }
-    
-    const pubkey = await dbGet('pubkey');
-    if (!pubkey) {
-      throw new Error('Public key not found');
-    }
-    
-    keypair = {
-      pubkey: base64ToU8(pubkey),
-      seckey: seckey
-    };
-    
-    // Secure memory: overwrite the password in memory would require
-    // explicit cleanup (not possible in JS, but we've minimized exposure)
-    return keypair;
-  }
-
-  // Create new keypair with password
-  async function createKeypairWithPassword(password) {
-    if (!password || password.length < 12) {
-      throw new Error('Password must be at least 12 characters');
-    }
-    
-    // Generate new Ed25519 keypair
-    const kp = nacl.sign.keyPair();
-    keypair = {
-      pubkey: kp.publicKey,
-      seckey: kp.secretKey
-    };
-    
-    // Wrap the secret key with the password
-    const wrapped = await wrapKey(kp.secretKey, password);
-    
-    // Store in IndexedDB
-    await dbPut('wrapped_key', wrapped);
-    await dbPut('pubkey', u8ToBase64(kp.publicKey));
-    await dbPut('created_at', Date.now());
-    
-    hasWrappedKey = true;
-    
-    return keypair;
-  }
-
-  // Load keypair (legacy localStorage support for migration)
-  function loadKeypair() {
-    const stored = localStorage.getItem('tm_keypair');
-    if (stored) {
-      try {
-        const parsed = JSON.parse(stored);
-        keypair = {
-          pubkey: base64ToU8(parsed.pubkey),
-          seckey: base64ToU8(parsed.seckey)
-        };
-        return keypair;
-      } catch(e) {
-        localStorage.removeItem('tm_keypair');
-      }
-    }
-    return null;
-  }
-
-  // Generate new keypair (legacy - requires password now)
-  async function generateKeypair(password) {
-    if (password) {
-      return await createKeypairWithPassword(password);
-    }
-    throw new Error('Password required to generate keypair');
-  }
-
-  // Check if user has a stored key
-  function hasWrappedKeySync() {
-    return hasWrappedKey;
-  }
-
-  function getPubkey() {
-    return keypair ? keypair.pubkey : null;
-  }
-
-  function getSecretKey() {
-    return keypair ? keypair.seckey : null;
-  }
-
-  function getPubkeyHex() {
-    const pk = getPubkey();
-    return pk ? u8ToHex(pk) : null;
-  }
-
-  function sign(msgHex) {
-    if (!keypair) return null;
-    const msg = hexToU8(msgHex);
-    const sig = nacl.sign.detached(msg, keypair.seckey);
-    return u8ToHex(sig);
-  }
-
-  // Generate deterministic encryption key for order-specific E2E
-  function deriveOrderKey(orderId, counterpartyPubkey) {
-    if (!keypair) return null;
-    const shared = nacl.box.before(
-      typeof counterpartyPubkey === 'string' ? hexToU8(counterpartyPubkey) : counterpartyPubkey,
-      keypair.seckey
-    );
-    const orderKey = nacl.hash(new Uint8Array([...shared, ...(typeof orderId === 'string' ? hexToU8(orderId) : orderId)]));
-    return u8ToHex(orderKey.slice(0, 32));
-  }
-
-  function encryptForOrder(orderId, counterpartyPubkey, plaintext) {
-    const keyHex = deriveOrderKey(orderId, counterpartyPubkey);
-    if (!keyHex) return null;
-    const key = hexToU8(keyHex);
-    const nonce = nacl.randomBytes(24);
-    const encrypted = nacl.secretbox(
-      new TextEncoder().encode(plaintext),
-      nonce,
-      key
-    );
-    if (!encrypted) return null;
-    return u8ToHex(new Uint8Array([...nonce, ...encrypted]));
-  }
-
-  function decryptForOrder(orderId, counterpartyPubkey, ciphertextHex) {
-    const keyHex = deriveOrderKey(orderId, counterpartyPubkey);
-    if (!keyHex) return null;
-    const key = hexToU8(keyHex);
-    const data = hexToU8(ciphertextHex);
-    const nonce = data.slice(0, 24);
-    const encrypted = data.slice(24);
-    const decrypted = nacl.secretbox.open(encrypted, nonce, key);
-    if (!decrypted) return null;
-    return new TextDecoder().decode(decrypted);
-  }
-
-  function hashPubkey(pubkeyHex) {
-    const pk = hexToU8(pubkeyHex);
-    const h = nacl.hash(pk);
-    return u8ToHex(h.slice(0, 32));
-  }
-
-  // Encryption for listing metadata
-  function encryptListingData(title, desc, price, key) {
-    const plaintext = JSON.stringify({ title, desc, price });
-    if (!key) key = nacl.randomBytes(32);
-    const nonce = nacl.randomBytes(24);
-    const encrypted = nacl.secretbox(
-      new TextEncoder().encode(plaintext),
-      nonce,
-      key
-    );
-    if (!encrypted) return null;
-    return {
-      encrypted: u8ToHex(new Uint8Array([...nonce, ...encrypted])),
-      key: u8ToHex(key)
-    };
-  }
-
-  function decryptListingData(encryptedHex, keyHex) {
-    const key = hexToU8(keyHex);
-    const data = hexToU8(encryptedHex);
-    const nonce = data.slice(0, 24);
-    const encrypted = data.slice(24);
-    const decrypted = nacl.secretbox.open(encrypted, nonce, key);
-    if (!decrypted) return null;
-    try {
-      return JSON.parse(new TextDecoder().decode(decrypted));
-    } catch(e) {
-      return null;
-    }
-  }
-
-  // Clear all stored keys (logout)
-  async function clearKeys() {
-    keypair = null;
-    hasWrappedKey = false;
-    await dbDelete('wrapped_key');
-    await dbDelete('pubkey');
-    await dbDelete('created_at');
-    localStorage.removeItem('tm_keypair');
-  }
-
-  // Listing key management (stored in IndexedDB)
-  async function getAllListingKeys() {
-    return await dbGetAllListingKeys();
-  }
-
-  async function saveListingKey(listingId, keyHex) {
-    await dbPutListingKey(listingId, keyHex);
-  }
-
-  // Hex/Base64 utilities
   function u8ToHex(buf) {
     return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
   }
 
   function hexToU8(hex) {
-    const len = hex.length / 2;
-    const buf = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-      buf[i] = parseInt(hex.substr(i * 2, 2), 16);
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
     }
-    return buf;
+    return bytes;
   }
 
   function u8ToBase64(buf) {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    let result = '';
-    for (let i = 0; i < buf.length; i += 3) {
-      const b = (buf[i] << 16) | (buf[i+1] << 8) | buf[i+2];
-      result += chars[(b >> 18) & 63] + chars[(b >> 12) & 63] + chars[(b >> 6) & 63] + chars[b & 63];
-    }
-    const pad = buf.length % 3;
-    if (pad === 1) result = result.slice(0, -2) + '==';
-    if (pad === 2) result = result.slice(0, -1) + '=';
-    return result;
+    let binary = '';
+    buf.forEach(b => { binary += String.fromCharCode(b); });
+    return btoa(binary);
   }
 
-  function base64ToU8(str) {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    str = str.replace(/=+$/, '');
-    const buf = new Uint8Array(Math.floor(str.length * 3 / 4));
-    let j = 0;
-    for (let i = 0; i < str.length; i += 4) {
-      const a = chars.indexOf(str[i]) << 18;
-      const b = chars.indexOf(str[i+1]) << 12;
-      const c = chars.indexOf(str[i+2]) << 6;
-      const d = chars.indexOf(str[i+3]);
-      buf[j++] = (a | b) >> 16;
-      if (str[i+2] !== undefined) buf[j++] = (b | c) >> 8 & 255;
-      if (str[i+3] !== undefined) buf[j++] = (c | d) & 255;
-    }
-    return buf;
+  function base64ToU8(b64) {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
   }
 
-  // Initialize: check for existing wrapped key
-  hasStoredKey();
+  function randomNonceHex() {
+    return u8ToHex(crypto.getRandomValues(new Uint8Array(16)));
+  }
+
+  async function deriveKey(password, salt) {
+    const enc = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']
+    );
+    const bits = await crypto.subtle.deriveBits(
+      { name: 'PBKDF2', salt, iterations: 600000, hash: 'SHA-256' },
+      keyMaterial, 256
+    );
+    return new Uint8Array(bits);
+  }
+
+  async function wrapKey(secretKey, password) {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const key = await deriveKey(password, salt);
+    const nonce = nacl.randomBytes(24);
+    const wrapped = nacl.secretbox(secretKey, nonce, key);
+    return { salt: u8ToBase64(salt), nonce: u8ToBase64(nonce), wrapped: u8ToBase64(wrapped) };
+  }
+
+  async function unwrapKey(wrappedData, password) {
+    const salt = base64ToU8(wrappedData.salt);
+    const nonce = base64ToU8(wrappedData.nonce);
+    const wrapped = base64ToU8(wrappedData.wrapped);
+    const key = await deriveKey(password, salt);
+    const secretKey = nacl.secretbox.open(wrapped, nonce, key);
+    if (!secretKey) throw new Error('Wrong password');
+    return secretKey;
+  }
+
+  async function hasStoredKey() {
+    const wrapped = await dbGet(STORE_NAME, 'wrapped_key');
+    return !!wrapped;
+  }
+
+  async function unlockWithPassword(password) {
+    const wrapped = await dbGet(STORE_NAME, 'wrapped_key');
+    if (!wrapped) throw new Error('No stored identity');
+    const seckey = await unwrapKey(wrapped, password);
+    const pubkey = base64ToU8(await dbGet(STORE_NAME, 'pubkey'));
+    keypair = { pubkey, seckey };
+    hasWrappedKey = true;
+    return keypair;
+  }
+
+  async function createKeypairWithPassword(password) {
+    if (!password || password.length < 12) {
+      throw new Error('Password must be at least 12 characters');
+    }
+    const kp = nacl.sign.keyPair();
+    keypair = { pubkey: kp.publicKey, seckey: kp.secretKey };
+    const wrapped = await wrapKey(kp.secretKey, password);
+    await dbPut(STORE_NAME, 'wrapped_key', wrapped);
+    await dbPut(STORE_NAME, 'pubkey', u8ToBase64(kp.publicKey));
+    await dbPut(STORE_NAME, 'created_at', Date.now());
+    const searchKey = crypto.getRandomValues(new Uint8Array(32));
+    await dbPut(STORE_NAME, SEARCH_KEY_ID, u8ToHex(searchKey));
+    hasWrappedKey = true;
+    return keypair;
+  }
+
+  async function generateKeypair(password) {
+    return createKeypairWithPassword(password);
+  }
+
+  function getPubkey() { return keypair ? keypair.pubkey : null; }
+  function getSecretKey() { return keypair ? keypair.seckey : null; }
+  function getPubkeyHex() { return keypair ? u8ToHex(keypair.pubkey) : null; }
+
+  function sign(msgHex) {
+    if (!keypair) return null;
+    const sig = nacl.sign.detached(hexToU8(msgHex), keypair.seckey);
+    return u8ToHex(sig);
+  }
+
+  function hashPubkey(pubkeyHex) {
+    const h = nacl.hash(hexToU8(pubkeyHex));
+    return u8ToHex(h.slice(0, 32));
+  }
+
+  async function getSearchKeyHex() {
+    let key = await dbGet(STORE_NAME, SEARCH_KEY_ID);
+    if (!key) {
+      key = u8ToHex(crypto.getRandomValues(new Uint8Array(32)));
+      await dbPut(STORE_NAME, SEARCH_KEY_ID, key);
+    }
+    return key;
+  }
+
+  async function buildListingPayload(title, desc, price) {
+    const w = await initWasm();
+    const contentKey = w.generate_content_key();
+    const plaintext = new TextEncoder().encode(JSON.stringify({ title, desc, price }));
+    const encrypted = w.encrypt_listing(plaintext, contentKey);
+    const searchKey = hexToU8(await getSearchKeyHex());
+    const token = w.search_token(title.toLowerCase().trim(), searchKey);
+    return {
+      blobHex: u8ToHex(encrypted),
+      contentKeyHex: u8ToHex(contentKey),
+      searchTokenHex: u8ToHex(token),
+    };
+  }
+
+  async function decryptListingBlob(blobHex, contentKeyHex) {
+    const w = await initWasm();
+    const decrypted = w.decrypt_listing(hexToU8(blobHex), hexToU8(contentKeyHex));
+    return JSON.parse(new TextDecoder().decode(decrypted));
+  }
+
+  async function saveListingKey(listingId, contentKeyHex) {
+    await dbPut(LISTING_KEYS_STORE, listingId, contentKeyHex);
+  }
+
+  async function getListingKey(listingId) {
+    return dbGet(LISTING_KEYS_STORE, listingId);
+  }
+
+  async function encryptWorkerOrder(orderData, workerPubkeyHex) {
+    const w = await initWasm();
+    const plaintext = new TextEncoder().encode(JSON.stringify(orderData));
+    const blob = w.encrypt_order(plaintext, hexToU8(workerPubkeyHex));
+    return u8ToBase64(blob);
+  }
+
+  function buildInitialOrderData(listingId, currency, sellerPubkeyHex) {
+    const buyerHex = getPubkeyHex();
+    const now = Math.floor(Date.now() / 1000);
+    return {
+      listing_id: listingId,
+      buyer_pubkey_hash: hashPubkey(buyerHex),
+      seller_pubkey_hash: sellerPubkeyHex ? hashPubkey(sellerPubkeyHex) : '',
+      buyer_pubkey: buyerHex,
+      seller_pubkey: sellerPubkeyHex || null,
+      state: 'pending',
+      currency: currency || 'XMR',
+      escrow_address: null,
+      escrow_amount: null,
+      time_lock_seconds: 7 * 86400,
+      created_at: now,
+      funded_at: null,
+      shipped_at: null,
+      confirmed_at: null,
+      released_at: null,
+      refunded_at: null,
+      expires_at: null,
+      disputed_at: null,
+      dispute_id: null,
+      owner_pubkey: null,
+      fee_percent: null,
+      fee_address: null,
+      dispute: null,
+      chat_messages: [],
+      settlement_txid: null,
+    };
+  }
+
+  async function saveOrderState(orderId, data, version) {
+    await dbPut(ORDER_STATE_STORE, orderId, { data, version });
+    const ids = (await dbGet(STORE_NAME, 'order_ids')) || [];
+    if (!ids.includes(orderId)) {
+      ids.push(orderId);
+      await dbPut(STORE_NAME, 'order_ids', ids);
+    }
+  }
+
+  async function getOrderState(orderId) {
+    return dbGet(ORDER_STATE_STORE, orderId);
+  }
+
+  async function listLocalOrderIds() {
+    return (await dbGet(STORE_NAME, 'order_ids')) || [];
+  }
+
+  async function signTransition(orderIdHex, prevVersion, blobBytes, nonceBytes, hourBucket) {
+    const w = await initWasm();
+    const seed = keypair.seckey.slice(0, 32);
+    const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', blobBytes));
+    const sig = w.sign_transition(
+      seed,
+      hexToU8(orderIdHex),
+      prevVersion,
+      hash,
+      nonceBytes,
+      hourBucket
+    );
+    return u8ToHex(sig);
+  }
+
+  async function encryptChatBlob(messages) {
+    const w = await initWasm();
+    const key = w.generate_content_key();
+    const plaintext = new TextEncoder().encode(JSON.stringify({ messages }));
+    const encrypted = w.encrypt_listing(plaintext, key);
+    return { blobB64: u8ToBase64(encrypted), keyHex: u8ToHex(key) };
+  }
+
+  async function decryptChatBlob(blobB64, keyHex) {
+    const w = await initWasm();
+    const decrypted = w.decrypt_listing(base64ToU8(blobB64), hexToU8(keyHex));
+    return JSON.parse(new TextDecoder().decode(decrypted));
+  }
+
+  async function saveChatKey(orderId, keyHex) {
+    await dbPut(ORDER_STATE_STORE, `chat:${orderId}`, keyHex);
+  }
+
+  async function getChatKey(orderId) {
+    return dbGet(ORDER_STATE_STORE, `chat:${orderId}`);
+  }
+
+  async function clearKeys() {
+    keypair = null;
+    hasWrappedKey = false;
+    for (const store of [STORE_NAME, LISTING_KEYS_STORE, ORDER_STATE_STORE]) {
+      const db = await openDB();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(store, 'readwrite');
+        const req = tx.objectStore(store).clear();
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    }
+    localStorage.removeItem('tm_keypair');
+  }
+
+  // Restore pubkey on page load (requires password to sign)
+  async function tryRestorePubkey() {
+    const pubkeyB64 = await dbGet(STORE_NAME, 'pubkey');
+    if (pubkeyB64) {
+      // pubkey only — user must unlock for signing
+      return u8ToHex(base64ToU8(pubkeyB64));
+    }
+    return null;
+  }
 
   return {
-    loadKeypair,
-    generateKeypair,
-    unlockWithPassword,
-    hasStoredKey,
-    hasWrappedKeySync,
-    getPubkey,
-    getSecretKey,
-    getPubkeyHex,
-    sign,
-    deriveOrderKey,
-    encryptForOrder,
-    decryptForOrder,
-    encryptListingData,
-    decryptListingData,
-    clearKeys,
-    hashPubkey,
-    u8ToHex,
-    hexToU8,
-    u8ToBase64,
-    base64ToU8,
-    getAllListingKeys,
-    saveListingKey
+    initWasm,
+    u8ToHex, hexToU8, u8ToBase64, base64ToU8,
+    randomNonceHex,
+    hasStoredKey, unlockWithPassword, createKeypairWithPassword, generateKeypair,
+    getPubkey, getSecretKey, getPubkeyHex, sign, hashPubkey,
+    buildListingPayload, decryptListingBlob, saveListingKey, getListingKey,
+    encryptWorkerOrder, buildInitialOrderData,
+    saveOrderState, getOrderState, listLocalOrderIds,
+    signTransition,
+    encryptChatBlob, decryptChatBlob, saveChatKey, getChatKey,
+    getSearchKeyHex,
+    clearKeys, tryRestorePubkey,
   };
 })();

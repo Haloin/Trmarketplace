@@ -9,4 +9,6 @@
 /data
 /config.toml
 .env
-Cargo.lock
+*.log
+wasm/pkg
+frontend/wasm

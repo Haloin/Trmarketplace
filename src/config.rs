@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub database: DatabaseConfig,
     pub server: ServerConfig,
@@ -53,6 +53,24 @@ pub struct TorConfig {
     pub service_dir: PathBuf,
     pub port: u16,
     pub onion_address: Option<String>,
+    /// SOCKS5 proxy address for outbound Tor connections.
+    /// All RPC traffic (BTC, XMR) is routed through this proxy.
+    /// Default: 127.0.0.1:9050 (standard Tor SOCKS port).
+    #[serde(default = "default_socks5_addr")]
+    pub socks5_addr: String,
+    /// Number of isolated Tor circuits in the connection pool.
+    /// Each circuit uses a different SOCKS auth username to force
+    /// Tor `IsolateSOCKSAuth` — a new circuit per pool slot.
+    #[serde(default = "default_socks5_pool_size")]
+    pub socks5_pool_size: usize,
+}
+
+fn default_socks5_addr() -> String {
+    "127.0.0.1:9050".to_string()
+}
+
+fn default_socks5_pool_size() -> usize {
+    8
 }
 
 impl Default for TorConfig {
@@ -62,6 +80,8 @@ impl Default for TorConfig {
             service_dir: PathBuf::from("data/tor"),
             port: 80,
             onion_address: None,
+            socks5_addr: default_socks5_addr(),
+            socks5_pool_size: default_socks5_pool_size(),
         }
     }
 }
@@ -143,11 +163,26 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub last_kek_rotation: Option<i64>,
     #[serde(default)]
-    pub admin_pubkey: Option<String>,
-    #[serde(default)]
     pub btc_min_payment_sats: u64,
     #[serde(default)]
     pub master_seed_hex: Option<String>,
+    /// Worker key for background job decryption (separate from API server key).
+    /// When set, background workers use this key to decrypt order blobs.
+    /// API handlers remain blind and cannot decrypt.
+    #[serde(default)]
+    pub worker_key_hex: Option<String>,
+    /// Admin RSA private key for blind signature protocol (PKCS#8 DER, hex).
+    #[serde(default)]
+    pub admin_privkey_hex: Option<String>,
+    /// Admin RSA public key (PKCS#1 DER, hex-encoded). Distribute to admin
+    /// clients. Embedded in production builds via env var `ADMIN_PUBKEY_HEX`.
+    #[serde(default)]
+    pub admin_pubkey_hex: Option<String>,
+    /// Worker X25519 public key for client-side order blob encryption.
+    /// Derived from `worker_key` via `derive_domain_key(key, "payment-decrypt")`.
+    /// The worker logs this pubkey at startup; copy it here for the API process.
+    #[serde(default)]
+    pub worker_payment_pubkey_hex: Option<String>,
 }
 
 impl Default for SecurityConfig {
@@ -159,9 +194,12 @@ impl Default for SecurityConfig {
             kek_hex: None,
             kek_version: 1,
             last_kek_rotation: None,
-            admin_pubkey: None,
             btc_min_payment_sats: 546,
             master_seed_hex: None,
+            worker_key_hex: None,
+            admin_privkey_hex: None,
+            admin_pubkey_hex: None,
+            worker_payment_pubkey_hex: None,
         }
     }
 }
@@ -250,19 +288,5 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("Failed to write config file: {}", e))?;
 
         Ok(())
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            database: DatabaseConfig::default(),
-            server: ServerConfig::default(),
-            tor: TorConfig::default(),
-            monero: MoneroConfig::default(),
-            bitcoin: BitcoinConfig::default(),
-            security: SecurityConfig::default(),
-            escrow: EscrowConfig::default(),
-        }
     }
 }

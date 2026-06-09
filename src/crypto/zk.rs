@@ -1,7 +1,4 @@
-//! Zero-Knowledge Encryption Module
-//! 
-//! This module provides encryption for data that the server stores but cannot read.
-//! All sensitive content is encrypted client-side, and the server only stores opaque blobs.
+//! Client-side encryption primitives; the server stores opaque blobs only.
 
 use serde::{Deserialize, Serialize};
 use chacha20poly1305::{
@@ -112,16 +109,12 @@ impl EncryptedBlob {
     }
 }
 
-/// Search token for encrypted search
-/// Uses deterministic encryption so the same search term produces the same token
+/// Search token: BLAKE3(keyword || search_key).
 pub struct SearchToken {
     pub token: Vec<u8>,
 }
 
 impl SearchToken {
-    /// Generate a deterministic search token from a keyword
-    /// This allows searching without revealing the plaintext
-    /// Note: The token itself is still encrypted/hashed so server can't reverse it
     pub fn generate(keyword: &str, search_key: &[u8]) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(keyword.as_bytes());
@@ -140,8 +133,7 @@ impl SearchToken {
     }
 }
 
-/// Client-side content encryption key (never sent to server)
-/// This key is generated and stored by the client
+/// Client-side content key (never sent to the server).
 #[derive(Clone, zeroize::Zeroize)]
 #[zeroize(drop)]
 pub struct ContentKey {
@@ -184,6 +176,32 @@ pub fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
     
     // Use subtle's ConstantTimeEq for timing-safe comparison
     a.ct_eq(b).unwrap_u8() == 1
+}
+
+/// Encrypt plaintext to a flat byte vector `nonce(12) || ciphertext`.
+/// Test-friendly wrapper around EncryptedBlob — matches the old encryption::EncryptionKey format.
+pub fn encrypt_test(pt: &[u8], kek: &KeyEncryptionKey) -> Result<Vec<u8>, CryptoError> {
+    let blob = EncryptedBlob::encrypt(pt, kek)?;
+    let mut out = Vec::with_capacity(12 + blob.ciphertext.len());
+    out.extend_from_slice(&blob.nonce);
+    out.extend_from_slice(&blob.ciphertext);
+    Ok(out)
+}
+
+/// Decrypt a flat byte vector `nonce(12) || ciphertext`.
+pub fn decrypt_test(data: &[u8], kek: &KeyEncryptionKey) -> Result<Vec<u8>, CryptoError> {
+    if data.len() < 12 {
+        return Err(CryptoError::DecryptionFailed);
+    }
+    let (nonce_bytes, ciphertext) = data.split_at(12);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(nonce_bytes);
+    let blob = EncryptedBlob {
+        ciphertext: ciphertext.to_vec(),
+        nonce,
+        version: 2,
+    };
+    blob.decrypt(kek)
 }
 
 /// Floor a Unix timestamp to the nearest 6-hour bucket.

@@ -1,12 +1,11 @@
-//! Bitcoin Payment Service (Low-level RPC client)
-//!
-//! Direct Bitcoin Core RPC interface.
-//! SECURITY: Uses u64 satoshis for all amounts (no float precision loss)
+//! Bitcoin Core RPC client (amounts in u64 satoshis).
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::config::BitcoinConfig;
@@ -14,6 +13,41 @@ use crate::crypto::zk::constant_time_compare;
 
 const SATOSHIS_PER_BTC: u64 = 100_000_000;
 const DUST_THRESHOLD_SATS: u64 = 546;
+
+/// All RPC request bodies are padded to this size on the wire
+/// to prevent traffic analysis from distinguishing operation types.
+const PADDED_BODY_SIZE: usize = 4096;
+
+/// Baseline for timing jitter (ms). Pre-request and post-response delays
+/// are each ~BASELINE_MS ± 30%, making total observable time per RPC call
+/// approximately 2× baseline regardless of server-side operation speed.
+const JITTER_BASELINE_MS: u64 = 1000;
+
+/// Pad a JSON-RPC body to exactly PADDED_BODY_SIZE bytes by inserting
+/// whitespace before the closing `}`. The result is still valid JSON.
+fn pad_json_body(body: &serde_json::Value) -> Vec<u8> {
+    let body_str = serde_json::to_string(body).expect("JSON serialization must not fail");
+    debug_assert!(body_str.ends_with('}'), "JSON body must end with '}}'");
+    let without_close = &body_str[..body_str.len() - 1];
+    let mut padded = String::with_capacity(PADDED_BODY_SIZE);
+    padded.push_str(without_close);
+    let remaining = PADDED_BODY_SIZE.saturating_sub(padded.len() + 1);
+    for _ in 0..remaining {
+        padded.push(' ');
+    }
+    padded.push('}');
+    debug_assert_eq!(padded.len(), PADDED_BODY_SIZE);
+    padded.into_bytes()
+}
+
+/// Sleep for JITTER_BASELINE_MS ± 30% to prevent timing-based
+/// traffic analysis from distinguishing fast vs slow operations.
+async fn jitter_delay() {
+    let jitter = rand::thread_rng().gen_range(
+        (JITTER_BASELINE_MS * 7 / 10)..=(JITTER_BASELINE_MS * 13 / 10)
+    );
+    tokio::time::sleep(Duration::from_millis(jitter)).await;
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, PartialOrd)]
 pub enum PaymentStatus {
@@ -61,15 +95,15 @@ pub struct TransactionDetail {
 }
 
 impl BitcoinClient {
-    pub fn new(config: BitcoinConfig) -> Result<Self, anyhow::Error> {
-        Ok(Self {
+    /// Create a new Bitcoin RPC client using a pre-built reqwest::Client.
+    /// The http client should come from Socks5Pool for circuit-isolated Tor routing.
+    pub fn new(config: BitcoinConfig, http: reqwest::Client) -> Self {
+        Self {
             config,
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()?,
+            http,
             nonce: Arc::new(Mutex::new(0)),
             last_block_hash: Arc::new(Mutex::new(None)),
-        })
+        }
     }
 
     fn auth_header(&self) -> Option<String> {
@@ -94,13 +128,18 @@ impl BitcoinClient {
             "params": params,
         });
 
-        let mut req = self.http.post(&self.config.rpc_url).json(&body);
+        let padded_body = pad_json_body(&body);
+
+        jitter_delay().await;
+        let mut req = self.http.post(&self.config.rpc_url).body(padded_body);
         if let Some(auth) = self.auth_header() {
             req = req.header("Authorization", auth);
         }
+        req = req.header("Content-Type", "application/json");
 
         let resp = req.send().await.map_err(|e| anyhow!("BTC RPC request failed: {}", e))?;
         let json: serde_json::Value = resp.json().await.map_err(|e| anyhow!("BTC RPC parse failed: {}", e))?;
+        jitter_delay().await;
 
         if let Some(error) = json.get("error") {
             if !error.is_null() {
@@ -175,7 +214,7 @@ impl BitcoinClient {
 
         let matching: Vec<TransactionDetail> = r.result
             .into_iter()
-            .filter(|tx| tx.address.as_ref().map_or(false, |a| constant_time_compare(a.as_bytes(), address.as_bytes())))
+            .filter(|tx| tx.address.as_ref().is_some_and(|a| constant_time_compare(a.as_bytes(), address.as_bytes())))
             .collect();
 
         Ok(matching)
@@ -214,6 +253,99 @@ impl BitcoinClient {
         let tx = self.get_transaction(tx_hash).await?;
         Ok(tx.confirmations.max(0) as u32)
     }
+
+    pub async fn list_unspent(&self, addresses: &[String]) -> Result<Vec<ListUnspentEntry>> {
+        #[derive(Deserialize)]
+        struct R { result: Vec<ListUnspentEntry> }
+        let r: R = self.rpc_call(
+            "listunspent",
+            serde_json::json!([0, 9999999, addresses]),
+        ).await?;
+        Ok(r.result)
+    }
+
+    /// Fetch a raw wallet transaction and decode its hex, including OP_RETURN data.
+    pub async fn get_raw_transaction(&self, tx_hash: &str) -> Result<RawTransaction> {
+        #[derive(Deserialize)]
+        struct R { result: RawTransaction }
+        let r: R = self.rpc_call(
+            "gettransaction",
+            serde_json::json!([tx_hash, true]),
+        ).await?;
+        Ok(r.result)
+    }
+
+    /// Fetch all wallet transactions since a given block height (uses `listsinceblock`).
+    /// Returns (transactions, last_block_hash).
+    pub async fn list_since_block(&self, block_hash: &str) -> Result<(Vec<ListSinceBlockEntry>, String)> {
+        #[derive(Deserialize)]
+        struct R {
+            result: ListSinceBlockResult,
+        }
+        #[derive(Deserialize)]
+        struct ListSinceBlockResult {
+            transactions: Vec<ListSinceBlockEntry>,
+            lastblock: String,
+        }
+        let r: R = self.rpc_call(
+            "listsinceblock",
+            serde_json::json!([block_hash]),
+        ).await?;
+        Ok((r.result.transactions, r.result.lastblock))
+    }
+
+    /// Decode a raw transaction hex into structured data, revealing all outputs.
+    pub async fn decode_raw_transaction(&self, hex: &str) -> Result<DecodedTx> {
+        #[derive(Deserialize)]
+        struct R { result: DecodedTx }
+        let r: R = self.rpc_call("decoderawtransaction", serde_json::json!([hex])).await?;
+        Ok(r.result)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListUnspentEntry {
+    pub txid: String,
+    pub vout: u32,
+    pub address: String,
+    pub amount: f64,
+    pub confirmations: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawTransaction {
+    pub hex: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListSinceBlockEntry {
+    pub txid: String,
+    pub address: Option<String>,
+    pub amount: f64,
+    pub confirmations: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DecodedTx {
+    pub txid: String,
+    pub hash: String,
+    pub version: i64,
+    pub size: i64,
+    pub vout: Vec<DecodedVout>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DecodedVout {
+    pub value: f64,
+    pub n: u32,
+    pub script_pub_key: DecodedScriptPubKey,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DecodedScriptPubKey {
+    pub asm: Option<String>,
+    pub hex: String,
+    pub r#type: Option<String>,
 }
 
 pub fn btc_f64_to_sats(amount: f64) -> u64 {
@@ -263,5 +395,47 @@ mod tests {
     fn test_payment_status_order() {
         assert!(PaymentStatus::Pending < PaymentStatus::Funded);
         assert!(PaymentStatus::Funded < PaymentStatus::Expired);
+    }
+
+    #[test]
+    fn test_btc_body_pads_to_4096() {
+        let bodies = vec![
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getblockcount","params":null}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"listtransactions","params":["*", 10000, 0, true]}),
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"gettransaction","params":["abc123", true]}),
+        ];
+        for body in &bodies {
+            let padded = pad_json_body(body);
+            assert_eq!(padded.len(), PADDED_BODY_SIZE);
+            assert!(padded.ends_with(b"}"));
+            let parsed: serde_json::Value = serde_json::from_slice(&padded)
+                .expect("Padded body must be valid JSON");
+            assert_eq!(parsed["jsonrpc"], "2.0");
+            assert_eq!(parsed["method"], body["method"]);
+        }
+    }
+
+    #[test]
+    fn test_btc_body_shorter_than_4096() {
+        let min_body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"x","params":null});
+        assert!(serde_json::to_string(&min_body).unwrap().len() < PADDED_BODY_SIZE,
+            "Precondition: minimal body is shorter than 4096");
+        let padded = pad_json_body(&min_body);
+        assert_eq!(padded.len(), PADDED_BODY_SIZE);
+    }
+
+    #[test]
+    fn test_btc_padding_roundtrip_preserves_semantics() {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "getbalance",
+            "params": {"account": 0, "minconf": 1},
+        });
+        let padded = pad_json_body(&body);
+        let parsed: serde_json::Value = serde_json::from_slice(&padded).unwrap();
+        assert_eq!(parsed["method"], "getbalance");
+        assert_eq!(parsed["id"], 42);
+        assert_eq!(parsed["params"]["minconf"], 1);
     }
 }

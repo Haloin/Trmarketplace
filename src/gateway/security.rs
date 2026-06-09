@@ -26,7 +26,7 @@ pub async fn security_headers_middleware(
         "camera=(), microphone=(), geolocation=(), interest-cohort=()"
     ));
     headers.insert("Content-Security-Policy", HeaderValue::from_static(
-        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     ));
     headers.insert("Cache-Control", HeaderValue::from_static("no-store, max-age=0"));
     headers.insert("Pragma", HeaderValue::from_static("no-cache"));

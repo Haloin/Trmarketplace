@@ -8,6 +8,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub fn generate_auth_token(auth_key: &[u8], pubkey: &[u8], hour_bucket: u64, path: &str) -> Option<Vec<u8>> {
     let mut mac = HmacSha256::new_from_slice(auth_key).ok()?;
+    mac.update(b"auth-token-v1");
     mac.update(pubkey);
     mac.update(&hour_bucket.to_le_bytes());
     mac.update(path.as_bytes());
@@ -42,6 +43,7 @@ pub fn verify_challenge(pk: &VerifyingKey, challenge: &[u8], signature: &[u8]) -
 }
 
 pub fn compute_hour_bucket(timestamp: i64) -> u64 {
+    if timestamp < 0 { return 0; }
     (timestamp / 3600) as u64
 }
 

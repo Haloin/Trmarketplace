@@ -4,8 +4,15 @@ use crate::crypto::oblivious;
 use crate::crypto::zk::floor_timestamp_6h;
 use crate::gateway::state::AppState;
 
+/// Get worker key for decryption. Workers must have worker_key set.
+fn get_worker_key(state: &AppState) -> anyhow::Result<&[u8; 32]> {
+    state.worker_key.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Worker key not configured - workers cannot decrypt"))
+}
+
 pub async fn check_time_locks(state: &Arc<AppState>) -> anyhow::Result<()> {
     let now = floor_timestamp_6h(time::OffsetDateTime::now_utc().unix_timestamp());
+    let worker_key = get_worker_key(state)?;
 
     let orders = sqlx::query_as::<_, Order>(
         "SELECT * FROM orders"
@@ -14,14 +21,14 @@ pub async fn check_time_locks(state: &Arc<AppState>) -> anyhow::Result<()> {
     .await?;
 
     for order in &orders {
-        let Some(raw) = oblivious::decrypt_order_blob(&order.encrypted_order_blob, &state.master_seed[..], &order.id) else { continue };
+        let Some(raw) = oblivious::decrypt_order_blob(&order.encrypted_order_blob, worker_key, &order.id) else { continue };
         let Ok(mut data) = serde_json::from_slice::<OrderData>(&raw) else { continue };
 
         let version = order.version;
         match data.state.as_str() {
-            "shipped" => handle_shipped(&state, &order.id, &mut data, now, version).await?,
-            "funded" => handle_funded(&state, &order.id, &mut data, now, version).await?,
-            "disputed" => handle_disputed(&state, &order.id, &mut data, now, version).await?,
+            "shipped" => handle_shipped(state, &order.id, &mut data, now, version).await?,
+            "funded" => handle_funded(state, &order.id, &mut data, now, version).await?,
+            "disputed" => handle_disputed(state, &order.id, &mut data, now, version).await?,
             _ => {}
         }
     }
@@ -30,12 +37,13 @@ pub async fn check_time_locks(state: &Arc<AppState>) -> anyhow::Result<()> {
 }
 
 fn has_active_dispute(data: &OrderData) -> bool {
-    data.dispute.as_ref().map_or(false, |d| d.resolved_at.is_none())
+    data.dispute.as_ref().is_some_and(|d| d.resolved_at.is_none())
 }
 
 async fn write_order(state: &Arc<AppState>, id: &[u8], data: &OrderData, version: i64) -> anyhow::Result<()> {
+    let worker_key = get_worker_key(state)?;
     let json = serde_json::to_vec(data)?;
-    let blob = oblivious::encrypt_order_blob(&json, &state.master_seed[..], id)
+    let blob = oblivious::encrypt_order_blob(&json, worker_key, id)
         .ok_or_else(|| anyhow::anyhow!("Encryption failed"))?;
     let expiry_bucket = data.expires_at.map(floor_timestamp_6h);
     let result = sqlx::query(

@@ -35,6 +35,9 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // Log the real error server-side so operators can debug.
+        // The response body is uniform to prevent oracle attacks.
+        tracing::error!(error = %self, "AppError returned to client");
         // Uniform error response — no distinguishing information.
         // All errors return 500 {"error":"error"} regardless of actual cause.
         // This prevents oracle attacks that exploit different error messages.

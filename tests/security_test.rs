@@ -44,29 +44,27 @@ mod tests {
 
     #[test]
     fn test_encryption_tamper_resistance() {
-        use tor_marketplace::crypto::encryption::EncryptionKey;
-        let key = EncryptionKey::generate();
+        use tor_marketplace::crypto::zk;
+        let kek = zk::KeyEncryptionKey::new();
         let plaintext = b"test data";
-        let mut encrypted = key.encrypt(plaintext).unwrap();
-        // Flip a bit in the nonce
+        let mut encrypted = zk::encrypt_test(plaintext, &kek).unwrap();
         encrypted[0] ^= 0xFF;
-        assert!(key.decrypt(&encrypted).is_err());
+        assert!(zk::decrypt_test(&encrypted, &kek).is_err());
     }
 
     #[test]
     fn test_empty_encrypted_data_fails() {
-        use tor_marketplace::crypto::encryption::EncryptionKey;
-        let key = EncryptionKey::generate();
-        assert!(key.decrypt(&[]).is_err());
-        assert!(key.decrypt(&[0u8; 10]).is_err());
+        use tor_marketplace::crypto::zk;
+        let kek = zk::KeyEncryptionKey::new();
+        assert!(zk::decrypt_test(&[], &kek).is_err());
+        assert!(zk::decrypt_test(&[0u8; 10], &kek).is_err());
     }
 
     #[test]
     fn test_short_encrypted_data_fails() {
-        use tor_marketplace::crypto::encryption::EncryptionKey;
-        let key = EncryptionKey::generate();
-        // Only nonce without data
+        use tor_marketplace::crypto::zk;
+        let kek = zk::KeyEncryptionKey::new();
         let short = vec![0u8; 20];
-        assert!(key.decrypt(&short).is_err());
+        assert!(zk::decrypt_test(&short, &kek).is_err());
     }
 }

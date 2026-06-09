@@ -1,58 +1,18 @@
+mod common;
+
 #[cfg(test)]
 mod tests {
     use axum::{
         body::Body,
         http::{Request, StatusCode},
-        Router,
     };
-    use std::sync::Arc;
     use tower::ServiceExt;
 
-    use tor_marketplace::config::{
-        BitcoinConfig, Config, DatabaseConfig, EscrowConfig, MoneroConfig, SecurityConfig,
-        ServerConfig, TorConfig,
-    };
-    use tor_marketplace::crypto::zk::KeyEncryptionKey;
-    use tor_marketplace::db;
-    use tor_marketplace::gateway;
-    use tor_marketplace::gateway::ratelimit::RateLimiter;
-
-    fn test_config() -> Config {
-        Config {
-            database: DatabaseConfig::Sqlite {
-                path: std::path::PathBuf::from(":memory:"),
-            },
-            server: ServerConfig {
-                server_secret: "test_secret_32_bytes_long_for_testing!!".to_string(),
-                ..ServerConfig::default()
-            },
-            tor: TorConfig::default(),
-            monero: MoneroConfig::default(),
-            bitcoin: BitcoinConfig::default(),
-            security: SecurityConfig::default(),
-            escrow: EscrowConfig::default(),
-        }
-    }
-
-    async fn setup_test_app() -> Router {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(2)
-            .connect(":memory:")
-            .await
-            .expect("Test DB failed");
-        db::run_sqlite_migrations(&pool).await.unwrap();
-
-        let config = Arc::new(test_config());
-        let kek = KeyEncryptionKey::new();
-        let rate_limiter = RateLimiter::new(30, 60);
-        let master_seed = [0u8; 32];
-
-        gateway::build_router(pool, config, kek, master_seed, rate_limiter)
-    }
+    use super::common;
 
     #[tokio::test]
     async fn test_challenge_valid_pubkey() {
-        let app = setup_test_app().await;
+        let app = common::setup_test_app().await;
         let pubkey_hex =
             "0101010101010101010101010101010101010101010101010101010101010101";
 
@@ -73,7 +33,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_challenge_invalid_pubkey() {
-        let app = setup_test_app().await;
+        let app = common::setup_test_app().await;
 
         let response = app
             .oneshot(
@@ -87,13 +47,13 @@ mod tests {
             .await
             .unwrap();
 
-        // All errors return 500 {"error":"error"} (Phase 1 anonymity — prevents oracle attacks)
+        // Uniform 500 errors — prevents oracle attacks
         assert!(response.status().is_server_error());
     }
 
     #[tokio::test]
     async fn test_verify_no_body() {
-        let app = setup_test_app().await;
+        let app = common::setup_test_app().await;
 
         let response = app
             .oneshot(
@@ -113,7 +73,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_body_rejected_as_500() {
-        let app = setup_test_app().await;
+        let app = common::setup_test_app().await;
 
         // POST to any Json endpoint with empty body → error_unifier converts 422 → 500
         let response = app
@@ -136,7 +96,7 @@ mod tests {
         use ed25519_dalek::Signer;
         use ed25519_dalek::SigningKey;
 
-        let app = setup_test_app().await;
+        let app = common::setup_test_app().await;
 
         // Generate a fresh ed25519 keypair for this test
         let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
@@ -197,7 +157,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_listings_no_auth() {
-        let app = setup_test_app().await;
+        let app = common::setup_test_app().await;
 
         let response = app
             .oneshot(
@@ -209,13 +169,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Auth failure returns 500 {"error":"error"} — uniform error response (Phase 1)
+        // Uniform 500 on auth failure
         assert!(!response.status().is_success());
     }
 
     #[tokio::test]
     async fn test_create_listing_no_auth() {
-        let app = setup_test_app().await;
+        let app = common::setup_test_app().await;
 
         let response = app
             .oneshot(

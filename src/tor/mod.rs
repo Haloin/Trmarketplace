@@ -32,7 +32,8 @@ impl TorService {
                  HiddenServicePort {} 127.0.0.1:{}\n\
                  HiddenServiceMaxStreams 1024\n\
                  CircuitIsolation 1\n\
-                 HiddenServiceAnonymousMode 1\n",
+                 HiddenServiceAnonymousMode 1\n\
+                 IsolateSOCKSAuth 1\n",
                 service_dir.display(),
                 self.config.port,
                 self.config.port,
